@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 test_continuous_websocket.py)",
+      "Bash(python3 test_full_pipeline.py)"
+    ]
+  }
+}

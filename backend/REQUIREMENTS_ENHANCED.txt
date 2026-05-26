@@ -1,0 +1,105 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENHANCED REQUIREMENTS FOR PRODUCTION-GRADE MULTI-VOICE AI AGENT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# CORE FRAMEWORK
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+aiofiles==24.1.0
+websockets>=12.0
+
+# CONFIGURATION & VALIDATION
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+httpx==0.28.1
+
+# AUDIO PROCESSING (Core)
+librosa>=0.10.0
+soundfile>=0.12.0
+torchaudio>=2.0.0
+
+# AUDIO PROCESSING (Enhanced)
+noisereduce>=3.0.0          # Noise reduction
+scipy>=1.10.0               # Signal processing (FFT, filtering, peak detection)
+pydub>=0.25.1              # Audio format handling & conversion
+audioread>=3.1.1           # Multi-format audio loading
+pyroomacoustics>=0.7.0     # Room acoustics, source localization (optional, advanced)
+pyloudnorm>=0.1.1          # Audio loudness normalization (production-grade)
+pedalboard>=0.8.0          # High-quality audio processing
+
+# ML & DEEP LEARNING
+torch>=2.0.0
+numpy==2.0.2
+scikit-learn>=1.3.0         # Clustering, metrics
+sentence-transformers>=2.7.0 # Speaker embeddings (better quality)
+faiss-cpu>=1.7.4           # Fast similarity search
+
+# SPEECH RECOGNITION & PROCESSING
+faster-whisper>=1.0.0       # Optimized Whisper (CPU-friendly)
+langdetect>=1.0.9
+pyannote.audio>=3.1.0      # Advanced diarization (GPU-accelerated)
+speechbrain>=1.0.0         # Sepformer voice separation (GPU)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONAL: PRODUCTION MONITORING & EVALUATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Audio Quality Assessment
+pesq>=0.0.4                # Speech quality (PESQ score)
+pystoi>=0.4.1              # Speech intelligibility (STOI score)
+mireval>=0.7              # Music/speech evaluation metrics
+
+# Performance Monitoring
+psutil>=5.9.0              # CPU/memory/disk usage monitoring
+prometheus-client>=0.17.0  # Prometheus metrics (for DevOps)
+
+# Logging & Debugging
+python-json-logger>=2.0.0  # Structured JSON logging
+rich>=13.0.0              # Rich logging output
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# OPTIONAL: TESTING & QUALITY ASSURANCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSTALLATION INSTRUCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# For CPU-ONLY deployment:
+# pip install -r REQUIREMENTS_ENHANCED.txt
+
+# For GPU deployment (NVIDIA CUDA 11.8):
+# pip uninstall torch torchaudio -y
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
+# pip install -r REQUIREMENTS_ENHANCED.txt
+
+# For GPU deployment (NVIDIA CUDA 12.1):
+# pip uninstall torch torchaudio -y
+# pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+# pip install -r REQUIREMENTS_ENHANCED.txt
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# The enhanced services include:
+# 1. EnhancedSeparationService: Multi-method overlap detection + CPU-friendly separation
+# 2. EnhancedDiarizationService: Prosody + embedding clustering + ensemble methods
+# 3. Better audio preprocessing with normalization
+# 4. Production monitoring and logging
+# 5. Quality assessment metrics
+
+# Libraries added for production use:
+# - scipy: Advanced signal processing (peak detection, FFT analysis)
+# - pydub: Multi-format audio handling
+# - pyroomacoustics: Room acoustics and source localization
+# - pyloudnorm: Loudness normalization (LUFS-based)
+# - pedalboard: High-quality audio effects
+# - pesq/pystoi: Audio quality metrics
+# - prometheus-client: Monitoring and metrics

@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/api/agent-api.ts","./src/api/http.ts","./src/components/app-shell.tsx","./src/features/voice-agent/voice-agent.tsx","./src/hooks/use-audio-recorder.ts","./src/types/chat.ts"],"errors":true,"version":"6.0.3"}
