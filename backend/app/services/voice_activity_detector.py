@@ -60,14 +60,15 @@ class VoiceActivityDetector:
         self.speech_start_time: Optional[float] = None
         self.audio_buffer: List[np.ndarray] = []
         
-        # Thresholds
+        # Thresholds — tuned for continuous-speech capture (longer pauses allowed
+        # before cutting a segment, so one user's continuous speech stays in one
+        # bubble instead of being fragmented).
         self.speech_threshold = 0.5
-        self.min_speech_duration_ms = 400  # Increased from 250ms to reduce false positives
-        # Shorter trailing-silence window so a pause between speakers cuts the
-        # segment sooner — this surfaces speaker switches at natural turn gaps
-        # (mitigates the per-segment diarization boundary limitation).
-        self.min_silence_duration_ms = 350
-        self.speech_pad_ms = 100
+        self.min_speech_duration_ms = 400
+        # Longer trailing-silence window: only cut a segment after a real pause
+        # (~1 second). Shorter pauses within a sentence won't fragment the speech.
+        self.min_silence_duration_ms = 1000
+        self.speech_pad_ms = 200
     
     def reset_states(self):
         """Reset all VAD states for a new session"""

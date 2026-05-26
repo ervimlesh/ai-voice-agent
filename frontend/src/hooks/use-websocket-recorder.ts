@@ -201,51 +201,89 @@ export function useWebSocketRecorder(callbacks: WSRecorderCallbacks = {}) {
     }
   }, []);
 
-  /** ---- Audio capture using ScriptProcessorNode ---- */
+  /** ---- Audio capture with native rate + downsampling to 16kHz ---- */
   const startAudioCapture = useCallback(async () => {
     try {
+      console.log('🎤 Requesting microphone access...');
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          sampleRate: 16000,
-          channelCount: 1,
           echoCancellation: true,
           noiseSuppression: true,
           autoGainControl: true,
+          channelCount: 1,
         },
       });
+      console.log('✅ Microphone access granted');
+
+      // Verify audio track is actually active
+      const audioTrack = stream.getAudioTracks()[0];
+      console.log(`🎙️ Audio track: ${audioTrack.label}, enabled: ${audioTrack.enabled}, muted: ${audioTrack.muted}`);
+      console.log(`🎙️ Track settings:`, audioTrack.getSettings());
+
       streamRef.current = stream;
 
-      const audioContext = new AudioContext({ sampleRate: 16000 });
+      // Use native sample rate - browsers handle this most reliably
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const audioContext = new AudioCtx();
+      const nativeSampleRate = audioContext.sampleRate;
+      const resampleRatio = nativeSampleRate / 16000;
+      console.log(`✅ AudioContext at ${nativeSampleRate}Hz, will downsample to 16kHz (ratio: ${resampleRatio.toFixed(2)})`);
       audioContextRef.current = audioContext;
 
       const source = audioContext.createMediaStreamSource(stream);
       sourceRef.current = source;
 
-      // Use ScriptProcessorNode to get raw PCM data
-      // Buffer size 4096 at 16kHz = ~256ms chunks
       const processor = audioContext.createScriptProcessor(4096, 1, 1);
       processorRef.current = processor;
 
+      let audioSent = 0;
+      let maxLevel = 0;
       processor.onaudioprocess = (e) => {
         const ws = wsRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
         const inputData = e.inputBuffer.getChannelData(0);
-        // Convert Float32 to Int16 PCM
-        const pcm16 = new Int16Array(inputData.length);
+
+        // Compute RMS level for monitoring
+        let sum = 0;
+        let peak = 0;
         for (let i = 0; i < inputData.length; i++) {
-          const s = Math.max(-1, Math.min(1, inputData[i]));
-          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          sum += inputData[i] * inputData[i];
+          const abs = Math.abs(inputData[i]);
+          if (abs > peak) peak = abs;
         }
+        const rms = Math.sqrt(sum / inputData.length);
+        if (peak > maxLevel) maxLevel = peak;
+
+        // Downsample using linear interpolation
+        const outputLength = Math.floor(inputData.length / resampleRatio);
+        const pcm16 = new Int16Array(outputLength);
+        for (let i = 0; i < outputLength; i++) {
+          const srcIdx = i * resampleRatio;
+          const idx0 = Math.floor(srcIdx);
+          const idx1 = Math.min(idx0 + 1, inputData.length - 1);
+          const frac = srcIdx - idx0;
+          const sample = inputData[idx0] * (1 - frac) + inputData[idx1] * frac;
+          const clamped = Math.max(-1, Math.min(1, sample));
+          pcm16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+        }
+
         ws.send(pcm16.buffer);
+        audioSent++;
+        if (audioSent % 20 === 0) {
+          const level = (rms * 100).toFixed(1);
+          const peakPct = (peak * 100).toFixed(1);
+          const maxPct = (maxLevel * 100).toFixed(1);
+          console.log(`📤 Sent ${audioSent} chunks | RMS: ${level}% | Peak: ${peakPct}% | Max: ${maxPct}% ${peak < 0.01 ? '⚠️ SILENT!' : '✅'}`);
+        }
       };
 
       source.connect(processor);
       processor.connect(audioContext.destination);
 
-      console.log('🎙️ Audio capture started (16kHz PCM)');
+      console.log('✅ Audio capture started');
     } catch (err) {
-      console.error('Error starting audio capture:', err);
+      console.error('❌ Error starting audio capture:', err);
       throw err;
     }
   }, []);
@@ -332,6 +370,7 @@ export function useWebSocketRecorder(callbacks: WSRecorderCallbacks = {}) {
     }
   }, []);
 
+  const cleanupRef = useRef<() => void>(() => {});
   const cleanup = useCallback(() => {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
@@ -347,12 +386,17 @@ export function useWebSocketRecorder(callbacks: WSRecorderCallbacks = {}) {
     setVadStatus({ speaking: false, confidence: 0 });
   }, [stopAudioCapture]);
 
-  // Cleanup on unmount
+  // Keep cleanup ref fresh without triggering effect re-run
+  useEffect(() => {
+    cleanupRef.current = cleanup;
+  }, [cleanup]);
+
+  // Cleanup ONLY on unmount (empty deps - runs once)
   useEffect(() => {
     return () => {
-      cleanup();
+      cleanupRef.current();
     };
-  }, [cleanup]);
+  }, []);
 
   return {
     state,

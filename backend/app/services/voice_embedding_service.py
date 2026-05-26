@@ -43,10 +43,16 @@ class VoiceEmbeddingService:
     def _resolve_device(self) -> str:
         want = getattr(self.settings, "voice_embedding_device", "auto") if self.settings else "auto"
         if want and want != "auto":
+            # speechbrain 1.x crashes on MPS — silently downgrade to CPU.
+            if want == "mps":
+                return "cpu"
             return want
         try:
             import torch
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                return "cuda"
+            # NOTE: speechbrain 1.x has incomplete MPS support; using CPU is safer.
+            return "cpu"
         except Exception:
             return "cpu"
 
@@ -112,9 +118,9 @@ class VoiceEmbeddingService:
             if len(audio) < min_len:
                 audio = np.pad(audio, (0, min_len - len(audio)))
 
-            wav = torch.from_numpy(audio).float().unsqueeze(0)
-            if self.device == "cuda":
-                wav = wav.cuda()
+            wav = torch.from_numpy(audio.copy()).float().unsqueeze(0)
+            if self.device in ("cuda", "mps"):
+                wav = wav.to(self.device)
 
             with torch.no_grad():
                 emb = self._model.encode_batch(wav)

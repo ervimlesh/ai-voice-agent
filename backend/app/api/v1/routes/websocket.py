@@ -466,10 +466,16 @@ async def _transcribe_and_label_clip(
     voice_embedder=None,
 ) -> Optional[dict]:
     """Transcribe one (possibly un-mixed) clip and produce a labeled turn dict."""
+    from app.services.whisper_service import is_whisper_hallucination
+
     text, lang = await asyncio.wait_for(
         whisper_service.transcribe_array(clip, sr), timeout=120.0
     )
-    if _is_garbage_transcript(text) or not text.strip():
+    if (
+        _is_garbage_transcript(text)
+        or not text.strip()
+        or is_whisper_hallucination(text)
+    ):
         return None
 
     # Identity: prefer neural ECAPA-TDNN fingerprints (accurate per-voice, incl.
@@ -539,13 +545,39 @@ async def _process_speech_segment(
         settings = get_settings()
         min_turn = settings.min_turn_duration_s
 
-        # 1) DIARIZE the segment into per-speaker turns (runs off the event loop).
-        diar_turns = await asyncio.to_thread(diarizer.diarize, audio, sr)
-        print(f"🗣️ Diarization produced {len(diar_turns)} turn(s) via {diarizer.backend}")
-
+        # 0) PRE-DIARIZATION OVERLAP CHECK: if heavy talk-over is detected on the
+        # whole segment, un-mix into separate voice streams BEFORE diarization.
+        # This catches the case where two speakers are simultaneous for most of
+        # the segment — diarization would otherwise pick one dominant voice and
+        # silently drop the other.
         emitted_turns: list[dict] = []
         last_patient_text: Optional[str] = None
         last_lang = "en"
+
+        whole_sep = await asyncio.to_thread(separator.maybe_separate, audio, sr)
+        if whole_sep.separated and whole_sep.streams:
+            print(
+                f"🔀 Pre-diarize: un-mixed full segment into {len(whole_sep.streams)} "
+                f"stream(s) (overlap ratio={whole_sep.overlap_ratio:.2f})"
+            )
+            for stream in whole_sep.streams:
+                turn = await _transcribe_and_label_clip(
+                    stream, sr, True, whisper_service, speaker_detector,
+                    role_detector, registry, 0.0, len(stream) / sr, voice_embedder,
+                )
+                if turn:
+                    emitted_turns.append(turn)
+                    last_lang = turn["language"]
+                    if turn["role"] == "Patient":
+                        last_patient_text = turn["text"].replace("[overlapping speech] ", "")
+
+            # When the whole segment was un-mixed, skip per-turn diarization —
+            # the streams are already speaker-separated.
+            diar_turns = []
+        else:
+            # 1) DIARIZE the segment into per-speaker turns.
+            diar_turns = await asyncio.to_thread(diarizer.diarize, audio, sr)
+            print(f"🗣️ Diarization produced {len(diar_turns)} turn(s) via {diarizer.backend}")
 
         # 2) Process each diarized turn in temporal order.
         for dt in diar_turns:
@@ -594,10 +626,49 @@ async def _process_speech_segment(
             })
             return
 
+        # 2b) Merge consecutive turns from same speaker into one bubble — but only
+        # under STRICT conditions to avoid gluing different speakers together:
+        #  - same speaker_id (voice fingerprint match)
+        #  - same role (Doctor/Patient/Relative)
+        #  - both turns have HIGH role confidence (≥75%)
+        #  - small time gap between turns (<0.5s)
+        #  - neither flagged as overlapping speech
+        MAX_GAP_S = 0.5
+        MIN_CONF = 75.0
+        merged_turns: list[dict] = []
+        for turn in emitted_turns:
+            if merged_turns:
+                prev = merged_turns[-1]
+                gap = turn["start"] - prev["end"]
+                same_speaker = prev["speaker_id"] == turn["speaker_id"]
+                same_role = prev["role"] == turn["role"]
+                high_conf = (
+                    prev["role_confidence"] >= MIN_CONF
+                    and turn["role_confidence"] >= MIN_CONF
+                )
+                no_overlap = not turn.get("overlap", False) and not prev.get("overlap", False)
+                tight_gap = gap < MAX_GAP_S
+
+                if same_speaker and same_role and high_conf and no_overlap and tight_gap:
+                    # Safe to merge
+                    prev_text = prev["text"].rstrip(" .,!?")
+                    new_text = turn["text"].lstrip()
+                    if prev_text.endswith((".", "!", "?")):
+                        prev["text"] = f"{prev_text} {new_text}"
+                    else:
+                        prev["text"] = f"{prev_text}. {new_text}"
+                    prev["end"] = turn["end"]
+                    prev["role_confidence"] = max(prev["role_confidence"], turn["role_confidence"])
+                    continue
+            merged_turns.append(dict(turn))
+
+        if len(merged_turns) != len(emitted_turns):
+            print(f"🔗 Merged {len(emitted_turns)} → {len(merged_turns)} bubble(s) (strict same-speaker rules)")
+
         # 3) Emit all labeled turns at once.
         await _safe_send_json(websocket, {
             "type": "speaker_turns",
-            "turns": emitted_turns,
+            "turns": merged_turns,
             "language": last_lang,
             "timestamp": time.time(),
         })

@@ -117,6 +117,10 @@ export function VoiceAgent() {
     // Relative / Unknown). This replaces the single-bubble onTranscript path.
     onSpeakerTurns: (turns, _language) => {
       if (!turns || turns.length === 0) return;
+      // No cross-segment merging in frontend — each VAD segment becomes its own
+      // bubble. Backend already merges within a segment. Cross-segment merging
+      // proved unsafe: voice-embedding misclassifications would glue different
+      // speakers together.
       setHistory((prev) => {
         const next = [...prev];
         for (const t of turns) {

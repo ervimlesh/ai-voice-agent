@@ -49,11 +49,17 @@ class DiarizationService:
                 from pyannote.audio import Pipeline
 
                 token = getattr(self.settings, "hf_token", None)
+                # The use_auth_token kwarg is intercepted by the shim in main.py
+                # and translated to the new token= name expected by huggingface_hub.
                 self._pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=token,
                 )
+
+                # pyannote's MPS path is unstable; force CPU unless CUDA is present.
                 device = self._resolve_device()
+                if device == "mps":
+                    device = "cpu"
                 self._pipeline.to(torch.device(device))
                 self.backend = "pyannote"
                 logger.info(f"✅ Diarization: pyannote on {device}")

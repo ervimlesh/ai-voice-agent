@@ -65,6 +65,9 @@ class SeparationService:
     def _resolve_device(self) -> str:
         dev = getattr(self.settings, "diarization_device", "auto")
         if dev != "auto":
+            # speechbrain 1.x has incomplete MPS support; downgrade to CPU.
+            if dev == "mps":
+                return "cpu"
             return dev
         try:
             import torch

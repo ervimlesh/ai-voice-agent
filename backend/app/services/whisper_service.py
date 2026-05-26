@@ -23,6 +23,49 @@ WEAK_PHRASES = {
     "you", "i", "the", "a", "an",
 }
 
+def is_whisper_hallucination(text: str) -> bool:
+    """Heuristically detect Whisper hallucinations using structural patterns
+    only (no hard-coded phrase list). Catches:
+      • empty / punctuation-only output
+      • the same word repeated 3+ times in a row
+      • danda-cluster spam common to Devanagari hallucinations
+      • bracketed sound tags like [music], (applause)
+      • duplicated phrase loops (Whisper's classic looping output)
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+
+    normalized = stripped.lower().rstrip(".,!?")
+    if not normalized:
+        return True
+
+    # Repeated single word/char patterns (e.g., "bye. bye. bye.")
+    words = normalized.replace(".", "").replace(",", "").split()
+    if len(words) >= 3 and len(set(words)) == 1:
+        return True
+
+    # Devanagari danda spam (e.g., "ब्रोकण आद सब।।।।।।")
+    if "।" in stripped and stripped.count("।") >= 4:
+        return True
+
+    # Bracketed sound tags (Whisper's caption-style noise output)
+    if normalized in {"[music]", "(music)", "[applause]", "(applause)",
+                      "[silence]", "(silence)", "music", "applause"}:
+        return True
+
+    # Duplicated phrase loop — split the text in half; if both halves are
+    # nearly identical, it's a Whisper repetition hallucination. Example:
+    # "Absolutely. So to gain weight. Absolutely. So to gain weight."
+    if len(words) >= 6:
+        mid = len(words) // 2
+        first = " ".join(words[:mid])
+        second = " ".join(words[mid:mid + len(words[:mid])])
+        if first and first == second:
+            return True
+
+    return False
+
 LANG_CODE_MAP = {
     "zh-cn": "zh", "zh-tw": "zh",
 }
@@ -69,18 +112,28 @@ class WhisperService:
     def _transcribe_with_options(
         self, model: WhisperModel, file_path: Path, language: str | None = None
     ) -> tuple[str, str]:
-        """Transcribe using faster-whisper with optimized settings."""
+        """Transcribe using faster-whisper with optimized settings for ACCURACY."""
         try:
+            # Honor WHISPER_LANGUAGE if set; otherwise auto-detect.
+            forced_lang = getattr(self.settings, "whisper_language", None)
+            effective_lang = language or forced_lang
             segments_generator, info = model.transcribe(
                 str(file_path),
                 task=self.settings.whisper_task,
-                language=language,
-                beam_size=5,  # Slightly larger for accuracy, still fast
-                best_of=1,
-                temperature=0.0,
+                language=effective_lang,
+                beam_size=10,  # Larger beam for better accuracy
+                best_of=5,  # Try multiple candidates and pick best
+                temperature=[0.0, 0.2, 0.4, 0.6, 0.8],  # Temperature fallback for low confidence
                 condition_on_previous_text=False,
-                vad_filter=True,  # Built-in VAD pre-filter for silence skipping
-                vad_parameters={"min_silence_duration_ms": 300},  # Skip short silence periods
+                vad_filter=True,
+                vad_parameters={
+                    "min_silence_duration_ms": 500,
+                    "threshold": 0.45,
+                },
+                # Confidence thresholds - reject hallucinations
+                no_speech_threshold=0.6,  # Higher = more strict silence detection
+                log_prob_threshold=-0.8,  # Reject low-confidence transcriptions
+                compression_ratio_threshold=1.8,  # Reject repetitive hallucinations
             )
 
             # Assemble full text from segments
@@ -192,19 +245,40 @@ class WhisperService:
         except Exception as e:
             logger.warning(f"Noise reduction skipped for array transcription: {e}")
 
+        forced_lang = getattr(self.settings, "whisper_language", None)
         segments_generator, info = model.transcribe(
             audio.astype(np.float32),
             task=self.settings.whisper_task,
-            beam_size=5,
-            best_of=1,
-            temperature=0.0,
+            language=forced_lang,
+            beam_size=10,
+            best_of=5,
+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
             condition_on_previous_text=False,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "threshold": 0.45,
+            },
+            no_speech_threshold=0.6,
+            log_prob_threshold=-0.8,
+            compression_ratio_threshold=1.8,
         )
         text = " ".join(segment.text.strip() for segment in segments_generator).strip()
         whisper_lang = info.language if info.language else "en"
+        lang_prob = info.language_probability if hasattr(info, 'language_probability') else 0.0
+
+        # Filter Whisper hallucinations (especially on silence/noise)
+        if is_whisper_hallucination(text):
+            logger.warning(f"🗑️ Filtered Whisper hallucination: '{text[:80]}'")
+            return "", "en"
+
+        # Low language confidence → likely garbage transcription
+        if lang_prob < 0.5 and len(text) < 30:
+            logger.warning(f"🗑️ Low language confidence ({lang_prob:.2f}) for short text: '{text[:50]}'")
+            return "", "en"
+
         language = self._consensus_language(whisper_lang, text)
+        logger.info(f"📝 Transcript: lang={language} (prob={lang_prob:.2f}) | text={text[:80]}")
         return text, language
 
     async def transcribe_array(self, audio: np.ndarray, sr: int = 16000) -> tuple[str, str]:

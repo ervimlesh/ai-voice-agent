@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     whisper_task: str = Field(default="transcribe", alias="WHISPER_TASK")
     whisper_device: str = Field(default="cpu", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(default="int8", alias="WHISPER_COMPUTE_TYPE")
+    # Force a specific language ("en", "hi", etc.) or leave None for auto-detect.
+    # Forcing language dramatically reduces script-misdetection garbage when the
+    # speaker's primary language is known.
+    whisper_language: str | None = Field(default=None, alias="WHISPER_LANGUAGE")
     ollama_base_url: str = Field(default="http://localhost:11434", alias="OLLAMA_BASE_URL")
     ollama_model: str = Field(default="llama3.2", alias="OLLAMA_MODEL")
     max_history_messages: int = Field(default=10, alias="MAX_HISTORY_MESSAGES")
