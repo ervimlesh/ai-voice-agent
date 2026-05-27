@@ -23,12 +23,50 @@ export interface SpeakerTurn {
   end: number;
   is_new_speaker: boolean;
   overlap?: boolean;
+  turn_id?: string;            // present once coalescing is active
+}
+
+/** Continuous-speaker coalescing events.
+ * `turn_new`    — open a new bubble keyed by turn_id.
+ * `turn_update` — append text / extend end time on an existing bubble.
+ * `turn_close`  — seal the bubble; no further updates expected.
+ */
+export interface TurnNewEvent {
+  turn_id: string;
+  speaker_id: string;
+  role: string;
+  role_confidence: number;
+  text: string;
+  start: number;
+  end: number;
+  is_new_speaker: boolean;
+  overlap: boolean;
+  language: string;
+}
+export interface TurnUpdateEvent {
+  turn_id: string;
+  speaker_id: string;
+  role: string;
+  role_confidence: number;
+  text: string;
+  end: number;
+  overlap: boolean;
+  language: string;
+}
+export interface TurnCloseEvent {
+  turn_id: string;
+  speaker_id: string;
+  final_text: string;
+  end: number;
 }
 
 export interface WSRecorderCallbacks {
   onTranscript?: (text: string, language: string, isValid: boolean) => void;
   onResponse?: (transcript: string, reply: string, speakerRole?: string, speakerConfidence?: number, ragSuggestions?: string[]) => void;
   onSpeakerTurns?: (turns: SpeakerTurn[], language: string) => void;
+  onTurnNew?: (turn: TurnNewEvent) => void;
+  onTurnUpdate?: (turn: TurnUpdateEvent) => void;
+  onTurnClose?: (turn: TurnCloseEvent) => void;
   onVADEvent?: (event: string, confidence: number) => void;
   onStatusChange?: (status: string) => void;
   onError?: (error: string) => void;
@@ -160,6 +198,18 @@ export function useWebSocketRecorder(callbacks: WSRecorderCallbacks = {}) {
         callbacksRef.current.onSpeakerTurns?.(data.turns ?? [], data.language);
         break;
 
+      case 'turn_new':
+        callbacksRef.current.onTurnNew?.(data as TurnNewEvent);
+        break;
+
+      case 'turn_update':
+        callbacksRef.current.onTurnUpdate?.(data as TurnUpdateEvent);
+        break;
+
+      case 'turn_close':
+        callbacksRef.current.onTurnClose?.(data as TurnCloseEvent);
+        break;
+
       case 'response':
         console.log('📤 Response received:', data.transcript);
         console.log(`🎙️ Speaker: ${data.speaker_role} (confidence: ${data.speaker_confidence}%)`);
@@ -205,20 +255,54 @@ export function useWebSocketRecorder(callbacks: WSRecorderCallbacks = {}) {
   const startAudioCapture = useCallback(async () => {
     try {
       console.log('🎤 Requesting microphone access...');
+      // Multi-voice capture: keep echo cancellation / noise suppression / AGC
+      // OFF. With them ON the browser deliberately removes any audio that's
+      // also coming from this device's own speakers — which is exactly the
+      // ChatGPT voice the user wants captured. Same reason we disable
+      // noiseSuppression (treats the other voice as background noise) and
+      // AGC (silences the quieter, speaker-played voice).
+      // The legacy goog* flags target Chrome/Chromium where echo cancellation
+      // is sometimes still applied even when the standard flag is false.
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
           channelCount: 1,
-        },
+          // Chrome-specific legacy flags — some Chromium builds still apply
+          // echo cancellation even when the standard flag is false.
+          googEchoCancellation: false,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: false,
+          googTypingNoiseDetection: false,
+        } as MediaTrackConstraints,
       });
       console.log('✅ Microphone access granted');
 
       // Verify audio track is actually active
       const audioTrack = stream.getAudioTracks()[0];
       console.log(`🎙️ Audio track: ${audioTrack.label}, enabled: ${audioTrack.enabled}, muted: ${audioTrack.muted}`);
-      console.log(`🎙️ Track settings:`, audioTrack.getSettings());
+      const applied = audioTrack.getSettings();
+      console.log(`🎙️ Track settings:`, applied);
+      // Multi-voice sanity check: warn loudly if the browser/OS overrode our
+      // raw-capture constraints and is still echo-cancelling or denoising the
+      // input. If any of these are true, audio coming from this machine's own
+      // speakers (e.g. ChatGPT voice) is being scrubbed before it reaches us.
+      const ac = (applied as { echoCancellation?: boolean }).echoCancellation;
+      const ns = (applied as { noiseSuppression?: boolean }).noiseSuppression;
+      const agc = (applied as { autoGainControl?: boolean }).autoGainControl;
+      if (ac || ns || agc) {
+        console.warn(
+          `⚠️ Browser/OS overrode raw-capture request — ` +
+          `echoCancellation=${ac} noiseSuppression=${ns} autoGainControl=${agc}. ` +
+          `ChatGPT's voice through speakers may be filtered out. ` +
+          `Workaround: use a virtual audio cable (BlackHole on macOS) to feed ` +
+          `ChatGPT's audio directly into the mic input.`
+        );
+      } else {
+        console.log('✅ Raw multi-voice capture enabled (echo/noise/AGC all off)');
+      }
 
       streamRef.current = stream;
 

@@ -48,12 +48,17 @@ class SeparationService:
             from speechbrain.inference.separation import SepformerSeparation
 
             self._device = self._resolve_device()
+            # speechbrain 1.x can't load directly on MPS — load on CPU then patch.
+            load_device = "cpu" if self._device == "mps" else self._device
             # WSJ0-2mix model handles 2 simultaneous speakers; downloaded once.
             self._model = SepformerSeparation.from_hparams(
                 source="speechbrain/sepformer-wsj02mix",
                 savedir="pretrained_models/sepformer-wsj02mix",
-                run_opts={"device": self._device},
+                run_opts={"device": load_device},
             )
+            if self._device == "mps":
+                from app.services._speechbrain_mps import force_speechbrain_to_mps
+                self._model = force_speechbrain_to_mps(self._model)
             self.backend = "sepformer"
             logger.info(f"✅ Separation: Sepformer on {self._device}")
         except Exception as e:
@@ -63,15 +68,17 @@ class SeparationService:
                 logger.error("Sepformer explicitly requested but failed to load")
 
     def _resolve_device(self) -> str:
+        """Resolve the requested device. MPS is now supported via the speechbrain workaround."""
         dev = getattr(self.settings, "diarization_device", "auto")
         if dev != "auto":
-            # speechbrain 1.x has incomplete MPS support; downgrade to CPU.
-            if dev == "mps":
-                return "cpu"
             return dev
         try:
             import torch
-            return "cuda" if torch.cuda.is_available() else "cpu"
+            if torch.cuda.is_available():
+                return "cuda"
+            if torch.backends.mps.is_available():
+                return "mps"
+            return "cpu"
         except Exception:
             return "cpu"
 

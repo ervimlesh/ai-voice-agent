@@ -49,8 +49,14 @@ class Settings(BaseSettings):
     )
     # "auto" picks cuda when a GPU is present, otherwise cpu.
     voice_embedding_device: str = Field(default="auto", alias="VOICE_EMBEDDING_DEVICE")
-    # Cosine-similarity threshold tuned for ECAPA embeddings (lower than MFCC's).
-    ecapa_match_threshold: float = Field(default=0.50, alias="ECAPA_MATCH_THRESHOLD")
+    # Cosine-similarity threshold tuned for ECAPA embeddings. Lowered from 0.50
+    # → 0.40 for multi-voice setups where the same physical voice arrives at
+    # variable volumes/distances (own voice vs phone speaker held near the mic
+    # vs ChatGPT through laptop speakers). At 0.50 the embeddings for the same
+    # person at different distances drifted below threshold and got registered
+    # as S3/S4/S5. 0.40 keeps real voice identity stable while still cleanly
+    # separating different people (different-speaker similarity typically <0.3).
+    ecapa_match_threshold: float = Field(default=0.40, alias="ECAPA_MATCH_THRESHOLD")
 
     # ── Source separation (overlap un-mixing, Tier A) ──
     separation_enabled: bool = Field(default=True, alias="SEPARATION_ENABLED")

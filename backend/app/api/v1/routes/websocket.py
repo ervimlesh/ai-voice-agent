@@ -8,6 +8,7 @@ import time
 import struct
 import unicodedata
 from collections import Counter
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -26,8 +27,41 @@ from app.api.dependencies import (
 from app.services.voice_activity_detector import VoiceActivityDetector, VADEvent
 from app.services.role_detector_service import RoleDetectorService, SpeakerRole
 from app.services.speaker_registry_service import SpeakerRegistry
+from app.services.conversation_state import ConversationState
 from app.core.config import get_settings
 from app.schemas.chat import ChatMessage
+
+# How often to sweep for idle bubbles and emit turn_close events.
+IDLE_SWEEP_INTERVAL_S = 1.0
+
+# ── Audio-energy thresholds (single source of truth) ──────────────────
+# Multi-voice setup notes:
+#   • Headset mic capture is quiet: own voice rms ≈ 0.008–0.014,
+#     peak ≈ 0.06–0.15.
+#   • A second voice (ChatGPT through laptop speakers / phone speaker held
+#     near the mic) arrives even quieter, typically peak ≈ 0.02–0.06.
+#   • Mic noise floor with no signal is peak < ~0.012.
+#
+# So we gate ONLY at the segment level on `peak` (not rms), and only against
+# the noise floor. Per-clip rms gating is intentionally disabled — it would
+# silently drop the other voice. Hallucination filtering is content-based
+# (see HALLUCINATION_SUBSTRINGS below and whisper_service.is_whisper_hallucination).
+SEGMENT_PEAK_NOISE_FLOOR = 0.015     # drop whole segment if peak < this
+MIN_SEGMENT_SAMPLES = 1600           # < 0.1s at 16 kHz: too short to diarize
+
+# Hallucination phrases Whisper emits on silence/noise. Anything containing
+# one of these as a substring is dropped, regardless of energy or speaker.
+HALLUCINATION_SUBSTRINGS = (
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for listening",
+    "thank you for listening",
+    "please subscribe",
+    "like and subscribe",
+    "see you next time",
+    "see you in the next",
+    "thank you so much for watching",
+)
 
 logger = logging.getLogger(__name__)
 
@@ -230,7 +264,7 @@ async def _process_speech_segment_with_signal(
     audio_segment_bytes: bytes,
     whisper_service,
     ollama_service,
-    history: list,
+    state: ConversationState,
     vad: VoiceActivityDetector,
     processing_lock: asyncio.Lock,
     speaker_detector,
@@ -248,7 +282,7 @@ async def _process_speech_segment_with_signal(
             audio_segment_bytes,
             whisper_service,
             ollama_service,
-            history,
+            state,
             vad,
             speaker_detector,
             role_detector,
@@ -287,13 +321,27 @@ async def audio_stream(websocket: WebSocket):
     separator = get_separation_service()
     voice_embedder = get_voice_embedding_service()
 
-    history: list[ChatMessage] = []
+    # Per-connection conversation state: open bubbles + per-speaker LLM history.
+    state = ConversationState()
     session_active = True
     processing_lock = asyncio.Lock()
     background_tasks = set()
 
     # Per-conversation dynamic speaker registry (handles 3+ speakers).
     registry = SpeakerRegistry(get_settings())
+
+    async def _idle_sweep_loop():
+        """Emit turn_close for any bubble idle past COALESCE_GAP_S."""
+        try:
+            while True:
+                await asyncio.sleep(IDLE_SWEEP_INTERVAL_S)
+                for msg in state.sweep_idle():
+                    if not await _safe_send_json(websocket, msg):
+                        return
+        except asyncio.CancelledError:
+            return
+
+    sweep_task = asyncio.create_task(_idle_sweep_loop())
 
     print("WebSocket connected: audio-stream")
 
@@ -323,7 +371,9 @@ async def audio_stream(websocket: WebSocket):
 
                     if cmd_type == "start_session":
                         vad.reset_states()
-                        history.clear()
+                        for msg in state.close_all():
+                            await _safe_send_json(websocket, msg)
+                        state.reset()
                         registry.reset()  # fresh speaker identities for new conversation
                         await websocket.send_json({
                             "type": "session_started",
@@ -340,7 +390,9 @@ async def audio_stream(websocket: WebSocket):
                         print("Session ended via WebSocket")
 
                     elif cmd_type == "reset_history":
-                        history.clear()
+                        for msg in state.close_all():
+                            await _safe_send_json(websocket, msg)
+                        state.reset()
                         vad.reset_states()
                         registry.reset()  # Reset speaker identities for new conversation
                         await websocket.send_json({
@@ -349,12 +401,12 @@ async def audio_stream(websocket: WebSocket):
                         })
 
                     elif cmd_type == "set_history":
-                        # Allow client to sync history
+                        # Allow client to sync history (legacy single-thread variant).
                         raw_history = cmd.get("history", [])
-                        history = [ChatMessage(**m) for m in raw_history]
+                        state.legacy_history = [ChatMessage(**m) for m in raw_history]
                         await websocket.send_json({
                             "type": "history_synced",
-                            "history_length": len(history),
+                            "history_length": len(state.legacy_history),
                             "timestamp": time.time()
                         })
 
@@ -400,7 +452,7 @@ async def audio_stream(websocket: WebSocket):
                                 vad_event.audio_segment,
                                 whisper_service,
                                 ollama_service,
-                                history,
+                                state,
                                 vad,
                                 processing_lock,
                                 speaker_detector,
@@ -429,6 +481,11 @@ async def audio_stream(websocket: WebSocket):
         except:
             pass
     finally:
+        sweep_task.cancel()
+        try:
+            await sweep_task
+        except (asyncio.CancelledError, Exception):
+            pass
         vad.reset_states()
         print("WebSocket cleanup complete")
 
@@ -468,15 +525,44 @@ async def _transcribe_and_label_clip(
     """Transcribe one (possibly un-mixed) clip and produce a labeled turn dict."""
     from app.services.whisper_service import is_whisper_hallucination
 
+    clip_dur_s = len(clip) / sr if sr else 0.0
+    rms = float(np.sqrt(np.mean(np.square(clip)))) if len(clip) else 0.0
     text, lang = await asyncio.wait_for(
         whisper_service.transcribe_array(clip, sr), timeout=120.0
     )
-    if (
-        _is_garbage_transcript(text)
-        or not text.strip()
-        or is_whisper_hallucination(text)
-    ):
+    # Multi-voice diagnostics: show every clip Whisper sees, its loudness,
+    # and which filter (if any) rejected it. If ChatGPT's voice is captured
+    # but missing from the UI, the reject reason here tells you why.
+    raw_preview = (text or "").strip().replace("\n", " ")[:100]
+    print(
+        f"🎧 Clip @{diar_start:.2f}-{diar_end:.2f}s "
+        f"(dur={clip_dur_s:.2f}s, rms={rms:.4f}, overlap={overlap_flag}) "
+        f"→ Whisper: '{raw_preview}'"
+    )
+
+    if not text.strip():
+        print(f"  ❌ Dropped: empty transcript (audio probably too quiet — "
+              f"check that ChatGPT's voice is loud enough to be captured)")
         return None
+    if _is_garbage_transcript(text):
+        print(f"  ❌ Dropped: garbage transcript filter")
+        return None
+    if is_whisper_hallucination(text):
+        print(f"  ❌ Dropped: Whisper hallucination filter")
+        return None
+    # Belt-and-braces guard for YouTube-trained Whisper hallucinations
+    # (see HALLUCINATION_SUBSTRINGS at the top of this module). Catches
+    # variants the structured `is_whisper_hallucination` check might miss
+    # (e.g. "Thanks for watching everyone!", trailing/leading filler text).
+    lowered = text.lower()
+    for hp in HALLUCINATION_SUBSTRINGS:
+        if hp in lowered:
+            print(f"  ❌ Dropped: hallucination substring '{hp}' in transcript")
+            return None
+    # NOTE: no per-clip RMS gate. The segment-level SEGMENT_PEAK_NOISE_FLOOR
+    # check has already rejected pure noise; here we trust diarization plus
+    # the content filters above so genuine quiet utterances (e.g. the second
+    # voice in a multi-voice scenario) reach the UI.
 
     # Identity: prefer neural ECAPA-TDNN fingerprints (accurate per-voice, incl.
     # separated overlapping streams); fall back to lightweight MFCC embedding.
@@ -490,6 +576,10 @@ async def _transcribe_and_label_clip(
     role, role_conf = registry.assign_role(speaker_id, content_role, content_conf)
 
     display_text = f"[overlapping speech] {text}" if overlap_flag else text
+    print(
+        f"  ✅ Kept as {speaker_id}/{role} ({role_conf:.0f}% conf, "
+        f"is_new={is_new}, lang={lang})"
+    )
     return {
         "speaker_id": speaker_id,
         "role": role,
@@ -508,7 +598,7 @@ async def _process_speech_segment(
     audio_segment_bytes: bytes,
     whisper_service,
     ollama_service,
-    history: list,
+    state: ConversationState,
     vad: VoiceActivityDetector,
     speaker_detector,
     role_detector,
@@ -532,8 +622,31 @@ async def _process_speech_segment(
 
         sr = 16000
         audio = np.frombuffer(audio_segment_bytes, dtype=np.float32)
+        seg_dur = len(audio) / sr if sr else 0.0
+        seg_rms = float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+        seg_peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+        print(
+            f"📥 Speech segment received: dur={seg_dur:.2f}s, "
+            f"rms={seg_rms:.4f}, peak={seg_peak:.4f}"
+        )
 
-        if len(audio) < 1600:  # < 0.1s
+        # Segment-level noise floor (see SEGMENT_PEAK_NOISE_FLOOR above for
+        # rationale and calibration notes). Below the floor there's no audible
+        # signal — only mic self-noise — so Whisper would hallucinate.
+        if seg_peak < SEGMENT_PEAK_NOISE_FLOOR:
+            print(
+                f"🚫 Segment dropped: peak={seg_peak:.4f} < {SEGMENT_PEAK_NOISE_FLOOR} "
+                f"(below mic noise floor — no signal)"
+            )
+            await _safe_send_json(websocket, {
+                "type": "processing",
+                "stage": "skipped",
+                "message": "Audio too quiet, skipped",
+                "timestamp": time.time(),
+            })
+            return
+
+        if len(audio) < MIN_SEGMENT_SAMPLES:  # < 0.1s at 16 kHz
             await _safe_send_json(websocket, {
                 "type": "processing",
                 "stage": "skipped",
@@ -552,6 +665,7 @@ async def _process_speech_segment(
         # silently drop the other.
         emitted_turns: list[dict] = []
         last_patient_text: Optional[str] = None
+        last_patient_speaker_id: Optional[str] = None
         last_lang = "en"
 
         whole_sep = await asyncio.to_thread(separator.maybe_separate, audio, sr)
@@ -570,6 +684,7 @@ async def _process_speech_segment(
                     last_lang = turn["language"]
                     if turn["role"] == "Patient":
                         last_patient_text = turn["text"].replace("[overlapping speech] ", "")
+                        last_patient_speaker_id = turn["speaker_id"]
 
             # When the whole segment was un-mixed, skip per-turn diarization —
             # the streams are already speaker-separated.
@@ -602,6 +717,7 @@ async def _process_speech_segment(
                         last_lang = turn["language"]
                         if turn["role"] == "Patient":
                             last_patient_text = turn["text"].replace("[overlapping speech] ", "")
+                            last_patient_speaker_id = turn["speaker_id"]
             else:
                 # Single dominant voice (optionally flagged as overlapped).
                 overlap_flag = sep.method == "flagged"
@@ -614,6 +730,7 @@ async def _process_speech_segment(
                     last_lang = turn["language"]
                     if turn["role"] == "Patient":
                         last_patient_text = turn["text"].replace("[overlapping speech] ", "")
+                        last_patient_speaker_id = turn["speaker_id"]
 
         if not emitted_turns:
             await _safe_send_json(websocket, {
@@ -626,15 +743,96 @@ async def _process_speech_segment(
             })
             return
 
-        # 2b) Merge consecutive turns from same speaker into one bubble — but only
-        # under STRICT conditions to avoid gluing different speakers together:
-        #  - same speaker_id (voice fingerprint match)
-        #  - same role (Doctor/Patient/Relative)
-        #  - both turns have HIGH role confidence (≥75%)
-        #  - small time gap between turns (<0.5s)
-        #  - neither flagged as overlapping speech
-        MAX_GAP_S = 0.5
-        MIN_CONF = 75.0
+        # 2a) Deduplicate redundant turns. We catch THREE cases:
+        #
+        #   (1) Pyannote emitted OVERLAPPING diarization turns in the same
+        #       segment — e.g. A "I am not growing so tell me how to grow"
+        #       AND B "so tell me how to grow". B is a substring of A.
+        #   (2) Whisper transcribed the same audio TWICE with a tiny
+        #       variation — e.g. "how to grown my height tell you about
+        #       so so so so" vs "how to grow my height tell you about so
+        #       so so so". Different by one character, but the same
+        #       utterance. Caught by fuzzy similarity (≥ 0.85).
+        #   (3) Cross-segment: the same phrase echoes from a still-open
+        #       bubble in a previous segment (e.g. acoustic echo back into
+        #       the mic). Caught by comparing against `state.open_turns`.
+        FUZZY_DUP_THRESHOLD = 0.85
+
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", (s or "").replace("[overlapping speech] ", "")).strip().lower()
+
+        def _is_dup(a: str, b: str) -> bool:
+            if not a or not b:
+                return False
+            # Substring covers the "A contains B" diarization case.
+            if a in b or b in a:
+                return True
+            # Fuzzy similarity covers the Whisper-retranscription case.
+            return SequenceMatcher(None, a, b).ratio() >= FUZZY_DUP_THRESHOLD
+
+        # Pre-compute normalized texts of currently-open bubbles for the
+        # cross-segment check. These represent bubbles already on the UI.
+        open_norms = [_norm(ot.text) for ot in state.open_turns.values()]
+
+        deduped_turns: list[dict] = []
+        for t in emitted_turns:
+            t_norm = _norm(t["text"])
+            if not t_norm:
+                continue
+            redundant = False
+
+            # (1)+(2) in-segment: drop t if another turn in this segment is
+            # longer AND duplicates t (substring OR fuzzy match).
+            for u in emitted_turns:
+                if u is t:
+                    continue
+                u_norm = _norm(u["text"])
+                if len(u_norm) > len(t_norm) and _is_dup(t_norm, u_norm):
+                    redundant = True
+                    break
+
+            # (3) cross-segment: drop t if it duplicates any currently-open
+            # bubble on the UI.
+            if not redundant:
+                for o_norm in open_norms:
+                    if _is_dup(t_norm, o_norm):
+                        redundant = True
+                        break
+
+            if not redundant:
+                deduped_turns.append(t)
+
+        if len(deduped_turns) != len(emitted_turns):
+            print(
+                f"🧹 Deduplicated redundant turns: "
+                f"{len(emitted_turns)} → {len(deduped_turns)}"
+            )
+            emitted_turns = deduped_turns
+            # Rebuild last_patient_* from the deduped list so the AI driver
+            # turn still points at a kept bubble.
+            last_patient_text = None
+            last_patient_speaker_id = None
+            for t in emitted_turns:
+                if t["role"] == "Patient":
+                    last_patient_text = t["text"].replace("[overlapping speech] ", "")
+                    last_patient_speaker_id = t["speaker_id"]
+
+        # If dedup wiped out every turn (entire segment was a duplicate of
+        # something already on screen), bail cleanly instead of falling
+        # through to the AI reply step with empty turns.
+        if not emitted_turns:
+            print("🧹 All turns in this segment were duplicates of existing bubbles — nothing to emit")
+            return
+
+        # 2b) Merge consecutive turns from same speaker into one bubble.
+        # Relaxed thresholds: a single continuous utterance from one person
+        # frequently has brief mid-thought pauses and produces 60–70% role
+        # confidence on each piece. The earlier strict gates (≥75% conf,
+        # <0.5s gap) caused one spoken sentence to render as two bubbles.
+        # The same_speaker_id + same_role check is still the safety net —
+        # we never merge across different voices.
+        MAX_GAP_S = 2.0
+        MIN_CONF = 50.0
         merged_turns: list[dict] = []
         for turn in emitted_turns:
             if merged_turns:
@@ -665,7 +863,29 @@ async def _process_speech_segment(
         if len(merged_turns) != len(emitted_turns):
             print(f"🔗 Merged {len(emitted_turns)} → {len(merged_turns)} bubble(s) (strict same-speaker rules)")
 
-        # 3) Emit all labeled turns at once.
+        # 3a) Route each merged turn through ConversationState so continuous
+        # same-speaker utterances coalesce into ONE bubble across segments. The
+        # state tracks per-speaker open bubbles so an interruption by speaker B
+        # doesn't break speaker A's open bubble — A's resume continues it.
+        now = time.time()
+        coalesce_events: list[dict] = []
+        for t in merged_turns:
+            for ev in state.coalesce_or_open(t, now=now):
+                coalesce_events.append(ev)
+                await _safe_send_json(websocket, ev)
+
+        # Attach the resolved turn_id back onto each merged turn for the legacy
+        # message, so any client that reads `speaker_turns` can still correlate.
+        new_or_update_by_speaker: dict[str, str] = {}
+        for ev in coalesce_events:
+            if ev["type"] in ("turn_new", "turn_update"):
+                new_or_update_by_speaker[ev["speaker_id"]] = ev["turn_id"]
+        for t in merged_turns:
+            tid = new_or_update_by_speaker.get(t["speaker_id"])
+            if tid:
+                t["turn_id"] = tid
+
+        # 3b) Legacy emit (kept for backwards-compat with older clients).
         await _safe_send_json(websocket, {
             "type": "speaker_turns",
             "turns": merged_turns,
@@ -677,6 +897,7 @@ async def _process_speech_segment(
         driver_text = last_patient_text or emitted_turns[-1]["text"].replace(
             "[overlapping speech] ", "")
         driver_role = "Patient" if last_patient_text else emitted_turns[-1]["role"]
+        driver_speaker_id = last_patient_speaker_id or emitted_turns[-1]["speaker_id"]
 
         rag_suggestions = await _get_suggestions(
             rag_service, ollama_service, driver_text, driver_role)
@@ -689,12 +910,24 @@ async def _process_speech_segment(
         }):
             return
 
+        # MULTI-VOICE CONTEXT: build a role-tagged transcript of this segment.
+        # When the user is talking to another voice agent (ChatGPT voice), both
+        # voices arrive in the same audio segment and are diarized as separate
+        # turns. The LLM must see BOTH — using per-speaker history alone hides
+        # the other voice and the assistant replies without context.
+        segment_user_text = ConversationState.build_segment_user_text(merged_turns) or driver_text
+
+        # Use the unified chronological history so the LLM sees EVERY speaker's
+        # prior turns, not just the driver's. This is what makes the multi-voice
+        # mode work: the "other" voice (e.g. ChatGPT) becomes part of context.
+        history = state.get_unified_history()
         try:
             reply = await asyncio.wait_for(
-                ollama_service.ask_generic_english(driver_text, history, last_lang),
+                ollama_service.ask_generic_english(segment_user_text, history, last_lang),
                 timeout=300.0,
             )
-            print(f"✅ AI Reply (driver={driver_role}): {reply}")
+            print(f"✅ AI Reply (driver={driver_role}/{driver_speaker_id}, "
+                  f"{len(merged_turns)} turn(s) in segment): {reply}")
         except asyncio.TimeoutError:
             logger.error("Ollama response generation timed out")
             await _safe_send_json(websocket, {
@@ -704,10 +937,10 @@ async def _process_speech_segment(
             })
             return
 
-        history.append(ChatMessage(role="user", content=driver_text))
-        history.append(ChatMessage(role="assistant", content=reply))
-        if len(history) > 20:
-            history[:] = history[-20:]
+        # Append this segment's combined transcript + reply to the unified history
+        # so the next segment's LLM call sees the full multi-voice conversation.
+        state.append_unified_user(segment_user_text)
+        state.append_unified_assistant(reply)
 
         await _safe_send_json(websocket, {
             "type": "response",
@@ -715,6 +948,7 @@ async def _process_speech_segment(
             "reply": reply,
             "language": last_lang,
             "speaker_role": driver_role,
+            "speaker_id": driver_speaker_id,
             "rag_suggestions": rag_suggestions,
             "turns": emitted_turns,
             "timestamp": time.time(),

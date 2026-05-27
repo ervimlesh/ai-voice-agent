@@ -56,10 +56,8 @@ class DiarizationService:
                     use_auth_token=token,
                 )
 
-                # pyannote's MPS path is unstable; force CPU unless CUDA is present.
+                # pyannote works on MPS for Apple Silicon (tested) — use the requested device.
                 device = self._resolve_device()
-                if device == "mps":
-                    device = "cpu"
                 self._pipeline.to(torch.device(device))
                 self.backend = "pyannote"
                 logger.info(f"✅ Diarization: pyannote on {device}")

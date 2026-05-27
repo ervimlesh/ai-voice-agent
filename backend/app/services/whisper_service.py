@@ -23,15 +23,61 @@ WEAK_PHRASES = {
     "you", "i", "the", "a", "an",
 }
 
+# Phrases Whisper notoriously emits on silent / near-silent audio because it
+# was trained on YouTube transcripts. They have no legitimate place in a
+# medical consultation, so we drop them whenever the entire transcript IS one
+# of these phrases (or a trivial variant). Match is exact after normalizing
+# (lowercase, strip surrounding punctuation/whitespace, collapse spaces).
+HALLUCINATION_PHRASES = {
+    "thanks for watching",
+    "thank you for watching",
+    "thanks for watching!",
+    "thank you for watching!",
+    "thanks so much for watching",
+    "thanks for listening",
+    "thank you for listening",
+    "thanks for tuning in",
+    "please subscribe",
+    "like and subscribe",
+    "subscribe to my channel",
+    "see you next time",
+    "see you in the next video",
+    "see you guys next time",
+    "see you next video",
+    "bye bye",
+    "bye-bye",
+    "thanks",
+}
+
+
+def _normalize_for_match(text: str) -> str:
+    import re
+    normalized = text.strip().lower()
+    normalized = re.sub(r"[\s\.,!?\-]+", " ", normalized).strip()
+    return normalized
+
+
+def is_known_hallucination_phrase(text: str) -> bool:
+    """Return True if the entire transcript matches a known Whisper
+    YouTube-style hallucination phrase."""
+    return _normalize_for_match(text).replace(" ", "") in {
+        _normalize_for_match(p).replace(" ", "") for p in HALLUCINATION_PHRASES
+    }
+
+
 def is_whisper_hallucination(text: str) -> bool:
     """Heuristically detect Whisper hallucinations using structural patterns
-    only (no hard-coded phrase list). Catches:
+    plus a small list of YouTube-style phrases Whisper emits on silent audio.
+    Catches:
       • empty / punctuation-only output
       • the same word repeated 3+ times in a row
       • danda-cluster spam common to Devanagari hallucinations
       • bracketed sound tags like [music], (applause)
       • duplicated phrase loops (Whisper's classic looping output)
+      • known YouTube-trained hallucination phrases ("thanks for watching", etc.)
     """
+    if is_known_hallucination_phrase(text):
+        return True
     stripped = text.strip()
     if not stripped:
         return True
@@ -234,16 +280,25 @@ class WhisperService:
         return await asyncio.to_thread(self._transcribe_sync, file_path)
 
     def _transcribe_array_sync(self, audio: np.ndarray, sr: int) -> tuple[str, str]:
-        """Transcribe an in-memory float32 audio slice (per-speaker sub-segment)."""
+        """Transcribe an in-memory float32 audio slice (per-speaker sub-segment).
+
+        Multi-voice tuning: when the user is talking to another voice agent
+        (e.g. ChatGPT voice on a phone) the secondary voice reaches the mic
+        via the room's acoustic path. It's quieter and less clean than the
+        user's own voice. We loosen Whisper's gates so this audio still
+        transcribes instead of being silently dropped:
+          - noise reduction OFF (was treating the other voice as noise)
+          - Whisper's own vad_filter OFF (we already gate with Silero VAD;
+            double-filtering with a 0.45 threshold dropped phone audio)
+          - no_speech_threshold lowered so degraded-but-real speech passes
+          - log_prob_threshold relaxed for lower-confidence transcripts
+          - the "low language confidence on short text" gate removed
+            (it was the most likely cause of ChatGPT's short replies
+             coming back as empty strings).
+        """
         model = self._get_model()
         if sr != 16000:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-
-        # Apply the same noise reduction used for file-based transcription.
-        try:
-            audio = nr.reduce_noise(y=audio, sr=16000, stationary=False, prop_decrease=0.75)
-        except Exception as e:
-            logger.warning(f"Noise reduction skipped for array transcription: {e}")
 
         forced_lang = getattr(self.settings, "whisper_language", None)
         segments_generator, info = model.transcribe(
@@ -254,27 +309,19 @@ class WhisperService:
             best_of=5,
             temperature=[0.0, 0.2, 0.4, 0.6, 0.8],
             condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters={
-                "min_silence_duration_ms": 500,
-                "threshold": 0.45,
-            },
-            no_speech_threshold=0.6,
-            log_prob_threshold=-0.8,
-            compression_ratio_threshold=1.8,
+            vad_filter=False,
+            no_speech_threshold=0.35,
+            log_prob_threshold=-1.5,
+            compression_ratio_threshold=2.4,
         )
         text = " ".join(segment.text.strip() for segment in segments_generator).strip()
         whisper_lang = info.language if info.language else "en"
         lang_prob = info.language_probability if hasattr(info, 'language_probability') else 0.0
 
-        # Filter Whisper hallucinations (especially on silence/noise)
+        # Only the structural hallucination filter remains — empty / repeat /
+        # caption-tag noise. Genuine quiet speech now gets through.
         if is_whisper_hallucination(text):
             logger.warning(f"🗑️ Filtered Whisper hallucination: '{text[:80]}'")
-            return "", "en"
-
-        # Low language confidence → likely garbage transcription
-        if lang_prob < 0.5 and len(text) < 30:
-            logger.warning(f"🗑️ Low language confidence ({lang_prob:.2f}) for short text: '{text[:50]}'")
             return "", "en"
 
         language = self._consensus_language(whisper_lang, text)

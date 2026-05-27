@@ -15,6 +15,8 @@ interface MessageWithSpeaker extends ChatMessage {
   overlap?: boolean;           // turn flagged as overlapping speech
   ragSuggestions?: string[];
   pending?: boolean;
+  turnId?: string;             // backend-coalesced bubble identity (continuous-speaker)
+  closed?: boolean;            // backend has sealed this bubble (turn_close received)
 }
 
 // Map a speaker role to a CSS modifier class for bubble coloring.
@@ -111,35 +113,60 @@ export function VoiceAgent() {
   }, []);
 
   // ─── WebSocket-based hands-free recorder (Silero VAD) ───
+  // Continuous-speaker bubble flow:
+  //   turn_new    → append a new bubble keyed by turn_id
+  //   turn_update → find the bubble by turn_id and replace its text/end
+  //   turn_close  → mark the bubble as sealed (no future updates)
+  // The legacy `speaker_turns` event still fires (back-compat) but we now use
+  // it only to drive sidebar suggestion removal — bubble lifecycle is owned by
+  // the three turn_* events.
   const wsRecorder = useWebSocketRecorder({
-    // The new multi-speaker path: each VAD segment yields one or more labeled
-    // turns. We render every turn as its own bubble (Doctor / Patient /
-    // Relative / Unknown). This replaces the single-bubble onTranscript path.
-    onSpeakerTurns: (turns, _language) => {
-      if (!turns || turns.length === 0) return;
-      // No cross-segment merging in frontend — each VAD segment becomes its own
-      // bubble. Backend already merges within a segment. Cross-segment merging
-      // proved unsafe: voice-embedding misclassifications would glue different
-      // speakers together.
+    onTurnNew: (turn) => {
+      setHistory((prev) => [
+        ...prev,
+        {
+          role: 'user',
+          content: turn.text,
+          speakerRole: (turn.role as SpeakerRoleLabel) || 'Unknown',
+          speakerId: turn.speaker_id,
+          speakerConfidence: turn.role_confidence,
+          overlap: turn.overlap,
+          turnId: turn.turn_id,
+        },
+      ]);
+      removeAskedSuggestions(turn.text);
+    },
+    onTurnUpdate: (turn) => {
       setHistory((prev) => {
-        const next = [...prev];
-        for (const t of turns) {
-          next.push({
-            role: 'user',
-            content: t.text,
-            speakerRole: (t.role as SpeakerRoleLabel) || 'Unknown',
-            speakerId: t.speaker_id,
-            speakerConfidence: t.role_confidence,
-            overlap: t.overlap,
-          });
-        }
+        const idx = prev.findIndex((m) => m.turnId === turn.turn_id);
+        if (idx < 0) return prev;
+        const next = prev.slice();
+        next[idx] = {
+          ...next[idx],
+          content: turn.text,
+          speakerRole: (turn.role as SpeakerRoleLabel) || next[idx].speakerRole,
+          speakerConfidence: turn.role_confidence,
+          overlap: turn.overlap,
+        };
         return next;
       });
-      // Drop any sidebar suggestion matching anything just spoken.
+      removeAskedSuggestions(turn.text);
+    },
+    onTurnClose: (turn) => {
+      setHistory((prev) => {
+        const idx = prev.findIndex((m) => m.turnId === turn.turn_id);
+        if (idx < 0) return prev;
+        const next = prev.slice();
+        next[idx] = { ...next[idx], closed: true };
+        return next;
+      });
+    },
+    onSpeakerTurns: (turns, _language) => {
+      // Bubble lifecycle is handled by turn_new/turn_update — here we only
+      // update status text and prune sidebar suggestions.
+      if (!turns || turns.length === 0) return;
       for (const t of turns) removeAskedSuggestions(t.text);
-      const summary = turns
-        .map((t) => `${t.speaker_id}·${t.role}`)
-        .join(', ');
+      const summary = turns.map((t) => `${t.speaker_id}·${t.role}`).join(', ');
       setStatus(`🗣️ ${turns.length} turn(s): ${summary}`);
     },
     onTranscript: (text, _language, isValid) => {
@@ -423,8 +450,10 @@ export function VoiceAgent() {
 
               return (
                 <article
-                  key={`${message.role}-${index}`}
-                  className={`message message-${message.role} ${speakerClass(role)}`}
+                  key={message.turnId ?? `${message.role}-${index}`}
+                  className={`message message-${message.role} ${speakerClass(role)}${
+                    message.closed ? ' message-closed' : ''
+                  }`}
                 >
                   <div className="message-role">
                     {label}

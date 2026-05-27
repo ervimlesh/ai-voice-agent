@@ -60,10 +60,11 @@ class VoiceActivityDetector:
         self.speech_start_time: Optional[float] = None
         self.audio_buffer: List[np.ndarray] = []
         
-        # Thresholds — tuned for continuous-speech capture (longer pauses allowed
-        # before cutting a segment, so one user's continuous speech stays in one
-        # bubble instead of being fragmented).
-        self.speech_threshold = 0.5
+        # Thresholds — tuned for multi-voice capture. Lower speech threshold so
+        # quieter speaker-played audio (e.g. ChatGPT voice through the laptop
+        # speakers, which is acoustically attenuated by the time it reaches the
+        # mic) still triggers a segment instead of being mistaken for silence.
+        self.speech_threshold = 0.35
         self.min_speech_duration_ms = 400
         # Longer trailing-silence window: only cut a segment after a real pause
         # (~1 second). Shorter pauses within a sentence won't fragment the speech.

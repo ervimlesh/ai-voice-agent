@@ -41,17 +41,17 @@ class VoiceEmbeddingService:
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def _resolve_device(self) -> str:
+        """Resolve the requested device. MPS is supported via the speechbrain workaround
+        (see app.services._speechbrain_mps)."""
         want = getattr(self.settings, "voice_embedding_device", "auto") if self.settings else "auto"
         if want and want != "auto":
-            # speechbrain 1.x crashes on MPS — silently downgrade to CPU.
-            if want == "mps":
-                return "cpu"
             return want
         try:
             import torch
             if torch.cuda.is_available():
                 return "cuda"
-            # NOTE: speechbrain 1.x has incomplete MPS support; using CPU is safer.
+            if torch.backends.mps.is_available():
+                return "mps"
             return "cpu"
         except Exception:
             return "cpu"
@@ -70,12 +70,17 @@ class VoiceEmbeddingService:
                 from speechbrain.pretrained import SpeakerRecognition
 
             logger.info(f"Loading ECAPA-TDNN voice embedding model on {self.device}...")
+            # speechbrain 1.x can't load directly on MPS — load on CPU then patch.
+            load_device = "cpu" if self.device == "mps" else self.device
             self._model = SpeakerRecognition.from_hparams(
                 source=model_id,
                 savedir=f"pretrained_models/{model_id.split('/')[-1]}",
-                run_opts={"device": self.device},
+                run_opts={"device": load_device},
             )
-            logger.info("✅ Voice embedding model ready (ECAPA-TDNN, neural fingerprints)")
+            if self.device == "mps":
+                from app.services._speechbrain_mps import force_speechbrain_to_mps
+                self._model = force_speechbrain_to_mps(self._model)
+            logger.info(f"✅ Voice embedding model ready on {self.device} (ECAPA-TDNN, neural fingerprints)")
         except Exception as e:
             logger.warning(
                 f"Voice embedding model unavailable ({e}); "

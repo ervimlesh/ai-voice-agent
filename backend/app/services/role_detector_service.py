@@ -24,56 +24,76 @@ class RoleDetectorService:
             "weak", "weakness", "sore", "rash", "itch", "itching", "bleeding",
             "discharge", "swelling", "inflammation", "burn", "burning",
             "symptom", "symptoms", "suffering", "trouble", "problem", "issue",
-            "worse", "better", "worse", "concerning", "worried", "anxious",
+            "worse", "concerning", "worried", "anxious",
             "sick", "ill", "unwell", "bad", "terrible", "horrible",
             # Time expressions (patient-typical)
             "since", "since last", "for days", "for weeks", "started",
             # Descriptions of experience
             "experiencing", "having", "getting", "feeling",
             "i have", "i'm having", "i've been", "it's been",
+            # Self-description of inability / desire (patient asking for help)
+            "i am not", "i'm not", "i can't", "i cannot", "i don't",
+            "i couldn't", "i didn't", "i want", "i need", "i want to",
+            "i need to", "help me", "i'm suffering",
         }
 
-        # Keywords and patterns for doctor speech
+        # Keywords and patterns for doctor speech.
+        # Intentionally avoiding generic phrases like "tell me" or "how are you"
+        # because patients say those just as often ("tell me how to grow",
+        # "how are you doing this test").
         self.doctor_keywords = {
-            # Medical questions
-            "when did", "how long", "does it", "do you have",
-            "any", "have you", "describe", "tell me", "how are you",
+            # Medical questions specific to clinical interview
+            "when did", "how long have", "does it", "do you have",
+            "describe the",
             # Medical terminology
             "diagnosis", "prescribe", "medication", "treatment", "therapy",
-            "examination", "physical", "vitals", "blood pressure",
-            "infection", "inflammation", "bacterial", "viral",
-            "based on", "seems like", "appears to be", "likely",
-            # Doctor actions
-            "let me", "i'll", "i need to", "we should", "you should",
-            "take", "rest", "hydrate", "medication", "antibiotics",
-            "monitor", "follow up", "come back", "see you",
+            "examination", "physical exam", "vitals", "blood pressure",
+            "infection", "bacterial", "viral",
+            "based on", "seems like", "appears to be",
+            # Doctor actions / directives
+            "i'll prescribe", "i need to examine", "we should run",
+            "you should take", "take this", "rest and hydrate",
+            "antibiotics", "monitor your", "follow up",
             # Professional language
-            "patient", "condition", "case", "referring", "consult",
-            "clinical", "medical", "health", "healthcare",
+            "the patient", "your condition", "referring you", "consult",
+            "clinical", "healthcare",
         }
 
-        # Patient-typical question patterns
+        # Patient-typical question patterns (asking for help / advice)
         self.patient_question_patterns = [
-            r"what.*do.*i",  # "what do I do"
-            r"should.*i",    # "should I"
-            r"will.*i",      # "will I"
-            r"can.*i",       # "can I"
-            r"is.*normal",   # "is this normal"
-            r"how.*treat",   # "how to treat"
-            r"what.*medication",  # "what medication"
+            r"what.*do.*i",          # "what do I do"
+            r"what.*should.*i",      # "what should i do"
+            r"should.*i",            # "should I"
+            r"will.*i",              # "will I"
+            r"can.*i",               # "can I"
+            r"is.*normal",           # "is this normal"
+            r"how.*to.*(treat|cure|fix|stop|avoid|grow|gain|lose|reduce|prevent)",
+            r"tell.*me.*how",        # "tell me how to grow"
+            r"how.*can.*i",          # "how can i"
+            r"why.*am.*i",           # "why am i"
+            r"why.*do.*i",           # "why do i"
+            r"what.*medication",     # "what medication"
+            r"i.*want.*to",          # "i want to grow"
+            r"i.*need.*to",          # "i need to know"
+            r"i.*am.*not",           # "i am not growing"
+            r"i'm.*not",             # "i'm not feeling well"
+            r"i.*can't",             # "i can't sleep"
+            r"i.*don't",             # "i don't feel"
         ]
 
-        # Doctor-typical question patterns
+        # Doctor-typical question patterns (clinical interview)
         self.doctor_question_patterns = [
-            r"when.*start",  # "when did it start"
-            r"how.*long",    # "how long has it"
-            r"where.*hurt",  # "where does it hurt"
-            r"does.*pain",   # "does it cause pain"
-            r"any.*other",   # "any other symptoms"
-            r"have you tried",  # "have you tried"
-            r"take.*medication",  # "are you taking medication"
-            r"allergic",     # "any allergies"
-            r"history",      # "medical history"
+            r"when.*did.*start",     # "when did it start"
+            r"how.*long.*had",       # "how long have you had"
+            r"how.*long.*been",      # "how long has it been"
+            r"where.*hurt",          # "where does it hurt"
+            r"does.*pain",           # "does it cause pain"
+            r"any.*other.*symptom",  # "any other symptoms"
+            r"have you tried",       # "have you tried"
+            r"are you taking",       # "are you taking medication"
+            r"allergic",             # "any allergies"
+            r"medical history",      # "medical history"
+            r"family history",       # "family history"
         ]
 
     def detect_role(self, text: str) -> Tuple[SpeakerRole, float]:
