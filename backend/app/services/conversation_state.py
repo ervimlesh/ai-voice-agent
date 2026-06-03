@@ -23,7 +23,17 @@ from typing import Dict, List, Optional, Tuple
 
 from app.schemas.chat import ChatMessage
 
+# Wall-clock gap: bubble idle past this in real time → seal it (idle sweep).
 COALESCE_GAP_S = 8.0
+# Audio-time gap: if a new turn's audio start is this far past the existing
+# bubble's audio end, treat it as a new utterance — even if the server
+# processed them in the same Python call (wall-time gap ≈ 0).
+#
+# This prevents a long VAD segment (e.g. 80s of rapid doctor-patient
+# back-and-forth) from collapsing all of one speaker's separated turns into
+# one giant bubble. Audio gap of 5s is the "obvious new utterance" boundary —
+# below that we still coalesce (continuous speech with thought pauses).
+AUDIO_COALESCE_GAP_S = 5.0
 PER_SPEAKER_HISTORY_LIMIT = 20
 UNIFIED_HISTORY_LIMIT = 30
 
@@ -73,10 +83,20 @@ class ConversationState:
 
         existing = self.open_turns.get(speaker_id)
         same_role = existing is not None and existing.role == turn["role"]
-        within_gap = (
+        within_wall_gap = (
             existing is not None
             and (now - existing.last_activity_wall) < self.coalesce_gap_s
         )
+        # Audio-time gap: turns inside one long segment all process at near-
+        # zero wall-time gap, so wall_gap alone collapses them. Use the audio
+        # timestamps to detect that two same-speaker pieces are actually far
+        # apart in the recording and should be separate bubbles.
+        audio_gap = (
+            (turn.get("start", 0.0) - existing.segment_end)
+            if existing is not None else float("inf")
+        )
+        within_audio_gap = existing is not None and audio_gap < AUDIO_COALESCE_GAP_S
+        within_gap = within_wall_gap and within_audio_gap
 
         if existing is not None and same_role and within_gap:
             new_text = (turn["text"] or "").strip()
@@ -105,7 +125,8 @@ class ConversationState:
         if existing is not None and not same_role:
             out.append(self._close_message(existing, now))
             del self.open_turns[speaker_id]
-        # Otherwise: same_role but gap exceeded — fall through to open a fresh bubble.
+        # Otherwise: same_role but wall_gap or audio_gap exceeded — close and
+        # open a fresh bubble for this new utterance.
         elif existing is not None and not within_gap:
             out.append(self._close_message(existing, now))
             del self.open_turns[speaker_id]

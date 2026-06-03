@@ -65,6 +65,42 @@ class Settings(BaseSettings):
     # Fraction of a segment that must be flagged as overlap before we attempt un-mixing.
     overlap_min_ratio: float = Field(default=0.15, alias="OVERLAP_MIN_RATIO")
 
+    # ── Realtime WebSocket pipeline tunables (the /ws/audio-stream flow) ──
+    # All previously-hardcoded constants from app/api/v1/routes/websocket.py,
+    # now overridable from .env.
+    # How often the idle-sweep loop seals quiet bubbles (turn_close), in seconds.
+    idle_sweep_interval_s: float = Field(default=1.0, alias="IDLE_SWEEP_INTERVAL_S")
+    # Drop a whole VAD segment when its peak amplitude is below this (mic noise floor).
+    # Lowered 0.015 → 0.010 so genuinely soft / low-tone speech (a quiet patient,
+    # a second voice) is no longer gated out as "too quiet". This is now safe
+    # because hallucinations on faint audio are caught downstream by the Whisper
+    # confidence gate (transcript_max_no_speech_prob / transcript_min_avg_logprob)
+    # instead of by a blunt energy threshold. Raise it again if room/mic self-noise
+    # starts producing phantom segments.
+    segment_peak_noise_floor: float = Field(default=0.010, alias="SEGMENT_PEAK_NOISE_FLOOR")
+    # ── Whisper confidence gate (anti-hallucination on faint speech) ──
+    # A per-clip transcript is dropped only when BOTH hold: Whisper thinks the
+    # clip is probably silence (no_speech_prob ≥ max) AND it decoded the words
+    # with low confidence (avg_logprob ≤ min). Both-must-hold keeps real quiet
+    # speech (which decodes confidently) while killing invented sentences.
+    # Loosen (raise no_speech / lower avg_logprob) if quiet real speech is being
+    # dropped; tighten if hallucinations still slip through.
+    transcript_max_no_speech_prob: float = Field(default=0.65, alias="TRANSCRIPT_MAX_NO_SPEECH_PROB")
+    transcript_min_avg_logprob: float = Field(default=-0.6, alias="TRANSCRIPT_MIN_AVG_LOGPROB")
+    # Segments shorter than this many samples (at 16 kHz) are too short to diarize.
+    min_segment_samples: int = Field(default=1600, alias="MIN_SEGMENT_SAMPLES")
+    # Fuzzy similarity (0-1) at/above which two turns are treated as the same utterance.
+    fuzzy_dup_threshold: float = Field(default=0.85, alias="FUZZY_DUP_THRESHOLD")
+    # Merge consecutive same-speaker turns when their gap is under this (seconds)…
+    merge_max_gap_s: float = Field(default=2.0, alias="MERGE_MAX_GAP_S")
+    # …and both turns carry at least this role confidence (0-100).
+    merge_min_conf: float = Field(default=50.0, alias="MERGE_MIN_CONF")
+    # Per-stage timeouts (seconds).
+    ws_receive_timeout_s: float = Field(default=120.0, alias="WS_RECEIVE_TIMEOUT_S")
+    transcribe_timeout_s: float = Field(default=120.0, alias="TRANSCRIBE_TIMEOUT_S")
+    rag_timeout_s: float = Field(default=30.0, alias="RAG_TIMEOUT_S")
+    ollama_timeout_s: float = Field(default=300.0, alias="OLLAMA_TIMEOUT_S")
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     @property

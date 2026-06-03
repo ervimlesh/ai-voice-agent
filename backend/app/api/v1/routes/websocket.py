@@ -31,8 +31,12 @@ from app.services.conversation_state import ConversationState
 from app.core.config import get_settings
 from app.schemas.chat import ChatMessage
 
+# Realtime-pipeline tunables come from .env via Settings (app/core/config.py).
+# The module-level aliases below are kept so existing call-sites read unchanged.
+_ws_settings = get_settings()
+
 # How often to sweep for idle bubbles and emit turn_close events.
-IDLE_SWEEP_INTERVAL_S = 1.0
+IDLE_SWEEP_INTERVAL_S = _ws_settings.idle_sweep_interval_s
 
 # ── Audio-energy thresholds (single source of truth) ──────────────────
 # Multi-voice setup notes:
@@ -46,8 +50,8 @@ IDLE_SWEEP_INTERVAL_S = 1.0
 # the noise floor. Per-clip rms gating is intentionally disabled — it would
 # silently drop the other voice. Hallucination filtering is content-based
 # (see HALLUCINATION_SUBSTRINGS below and whisper_service.is_whisper_hallucination).
-SEGMENT_PEAK_NOISE_FLOOR = 0.015     # drop whole segment if peak < this
-MIN_SEGMENT_SAMPLES = 1600           # < 0.1s at 16 kHz: too short to diarize
+SEGMENT_PEAK_NOISE_FLOOR = _ws_settings.segment_peak_noise_floor  # drop whole segment if peak < this
+MIN_SEGMENT_SAMPLES = _ws_settings.min_segment_samples           # < 0.1s at 16 kHz: too short to diarize
 
 # Hallucination phrases Whisper emits on silence/noise. Anything containing
 # one of these as a substring is dropped, regardless of energy or speaker.
@@ -356,7 +360,7 @@ async def audio_stream(websocket: WebSocket):
 
         while session_active:
             try:
-                message = await asyncio.wait_for(websocket.receive(), timeout=120.0)
+                message = await asyncio.wait_for(websocket.receive(), timeout=_ws_settings.ws_receive_timeout_s)
             except asyncio.TimeoutError:
                 # Send keepalive
                 if not await _safe_send_json(websocket, {"type": "keepalive", "timestamp": time.time()}):
@@ -495,7 +499,7 @@ async def _get_suggestions(rag_service, ollama_service, text: str, role: str) ->
     try:
         suggestions = await asyncio.wait_for(
             rag_service.get_suggested_questions_async(text, top_k=3),
-            timeout=30.0,
+            timeout=_ws_settings.rag_timeout_s,
         )
         if suggestions:
             print(f"🔍 RAG Suggestions ({role} spoke): {suggestions}")
@@ -528,7 +532,7 @@ async def _transcribe_and_label_clip(
     clip_dur_s = len(clip) / sr if sr else 0.0
     rms = float(np.sqrt(np.mean(np.square(clip)))) if len(clip) else 0.0
     text, lang = await asyncio.wait_for(
-        whisper_service.transcribe_array(clip, sr), timeout=120.0
+        whisper_service.transcribe_array(clip, sr), timeout=_ws_settings.transcribe_timeout_s
     )
     # Multi-voice diagnostics: show every clip Whisper sees, its loudness,
     # and which filter (if any) rejected it. If ChatGPT's voice is captured
@@ -566,13 +570,28 @@ async def _transcribe_and_label_clip(
 
     # Identity: prefer neural ECAPA-TDNN fingerprints (accurate per-voice, incl.
     # separated overlapping streams); fall back to lightweight MFCC embedding.
+    emb = None
     if voice_embedder is not None and voice_embedder.available:
         emb = await asyncio.to_thread(voice_embedder.embed, clip, sr)
+    if emb is not None:
         speaker_id, is_new = registry.identify(emb, threshold=voice_embedder.recommended_threshold)
     else:
+        # No neural embedding (model off, or it failed/returned None on this
+        # clip). Fall back to the MFCC fingerprint instead of blindly minting a
+        # brand-new speaker — minting one here is one of the ways a single
+        # continuous voice fragmented into phantom S2/S3/S4… identities.
         profile = speaker_detector.extract_features_from_array(clip, sr)
         speaker_id, is_new = registry.identify(profile.embedding)
-    content_role, content_conf = role_detector.detect_role(text)
+
+    # ── ROLE DETECTION DISABLED — VOICE-ONLY identity (per request) ──────────
+    # We do NOT classify Doctor/Patient from the WORDS spoken. In real life each
+    # person has a distinct voice, so identity comes purely from the ECAPA/MFCC
+    # voiceprint above (registry.identify → stable S1/S2/S3…). assign_role then
+    # labels by who-spoke-first (1st voice = Doctor, 2nd = Patient, 3rd+ =
+    # Relative) and keeps that label glued to the voice — no keyword guessing,
+    # no flip-flop. To re-enable content classification, restore the line below.
+    # content_role, content_conf = role_detector.detect_role(text)
+    content_role, content_conf = SpeakerRole.UNKNOWN, 0.0
     role, role_conf = registry.assign_role(speaker_id, content_role, content_conf)
 
     display_text = f"[overlapping speech] {text}" if overlap_flag else text
@@ -699,7 +718,15 @@ async def _process_speech_segment(
             s_idx = max(0, int(dt.start * sr))
             e_idx = min(len(audio), int(dt.end * sr))
             clip = audio[s_idx:e_idx]
+            clip_dur = len(clip) / sr if sr else 0.0
             if len(clip) < int(min_turn * sr):
+                # IMPORTANT: this is where short virtual-voice utterances die.
+                # Lower MIN_TURN_DURATION_S in .env to capture shorter clips
+                # (e.g. ChatGPT one-word replies, brief acknowledgements).
+                print(
+                    f"⏭️  Skipped diarized turn @{dt.start:.2f}-{dt.end:.2f}s "
+                    f"(dur={clip_dur:.2f}s < MIN_TURN_DURATION_S={min_turn}s)"
+                )
                 continue
 
             # 2a) Overlap handling: detect, and un-mix with Sepformer if available.
@@ -756,7 +783,7 @@ async def _process_speech_segment(
         #   (3) Cross-segment: the same phrase echoes from a still-open
         #       bubble in a previous segment (e.g. acoustic echo back into
         #       the mic). Caught by comparing against `state.open_turns`.
-        FUZZY_DUP_THRESHOLD = 0.85
+        FUZZY_DUP_THRESHOLD = _ws_settings.fuzzy_dup_threshold
 
         def _norm(s: str) -> str:
             return re.sub(r"\s+", " ", (s or "").replace("[overlapping speech] ", "")).strip().lower()
@@ -831,8 +858,8 @@ async def _process_speech_segment(
         # <0.5s gap) caused one spoken sentence to render as two bubbles.
         # The same_speaker_id + same_role check is still the safety net —
         # we never merge across different voices.
-        MAX_GAP_S = 2.0
-        MIN_CONF = 50.0
+        MAX_GAP_S = _ws_settings.merge_max_gap_s
+        MIN_CONF = _ws_settings.merge_min_conf
         merged_turns: list[dict] = []
         for turn in emitted_turns:
             if merged_turns:
@@ -924,7 +951,7 @@ async def _process_speech_segment(
         try:
             reply = await asyncio.wait_for(
                 ollama_service.ask_generic_english(segment_user_text, history, last_lang),
-                timeout=300.0,
+                timeout=_ws_settings.ollama_timeout_s,
             )
             print(f"✅ AI Reply (driver={driver_role}/{driver_speaker_id}, "
                   f"{len(merged_turns)} turn(s) in segment): {reply}")

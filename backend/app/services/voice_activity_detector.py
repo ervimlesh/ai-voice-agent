@@ -60,15 +60,25 @@ class VoiceActivityDetector:
         self.speech_start_time: Optional[float] = None
         self.audio_buffer: List[np.ndarray] = []
         
-        # Thresholds — tuned for multi-voice capture. Lower speech threshold so
-        # quieter speaker-played audio (e.g. ChatGPT voice through the laptop
-        # speakers, which is acoustically attenuated by the time it reaches the
-        # mic) still triggers a segment instead of being mistaken for silence.
-        self.speech_threshold = 0.35
-        self.min_speech_duration_ms = 400
-        # Longer trailing-silence window: only cut a segment after a real pause
-        # (~1 second). Shorter pauses within a sentence won't fragment the speech.
-        self.min_silence_duration_ms = 1000
+        # Thresholds — tuned for SLOW speech + multi-voice capture. Lower speech
+        # threshold so quieter/slower speech (a speaker deliberately drawing out
+        # words, or a second voice played through laptop speakers) still triggers
+        # a segment instead of being mistaken for silence.
+        self.speech_threshold = 0.30
+        self.min_speech_duration_ms = 300
+        # Trailing-silence window: how long a pause must last before we seal the
+        # segment. This was 250ms, which was tuned for RAPID exchanges — but it
+        # CUTS OFF slow/deliberate speakers mid-sentence, because a thoughtful
+        # speaker's pause between words easily exceeds 250ms and the segment
+        # ends before they finish. Raised to 700ms so slow speech stays in one
+        # segment and is transcribed completely.
+        #
+        # Multi-voice is NOT lost by this change: when two people land in the
+        # same segment (B starts within 700ms of A), the downstream pipeline
+        # still separates them — diarization splits the segment per speaker and
+        # the Sepformer separator un-mixes genuine talk-over. So we get complete
+        # slow-speech capture AND accurate multi-speaker detection.
+        self.min_silence_duration_ms = 700
         self.speech_pad_ms = 200
     
     def reset_states(self):
