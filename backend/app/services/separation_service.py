@@ -127,6 +127,26 @@ class SeparationService:
         # No un-mix available — report overlap so the caller can flag the turn.
         return SeparationResult(separated=False, overlap_ratio=ratio, method="flagged")
 
+    def force_separate(self, audio: np.ndarray, sr: int = 16000) -> SeparationResult:
+        """Un-mix a region ALREADY KNOWN to contain overlapping speakers.
+
+        Unlike maybe_separate(), this skips the spectral-flatness ratio gate. Use
+        it when an upstream signal (e.g. two diarized turns whose timestamps
+        overlap) already establishes that the region is shared — the per-clip
+        ratio heuristic would dilute a short (1-2s) overlap below threshold and
+        miss it. Returns un-mixed streams when Sepformer is available; otherwise
+        reports the region as 'flagged' so the caller can label it.
+        """
+        if self.backend == "sepformer" and self._model is not None:
+            try:
+                streams = self._separate_sepformer(audio, sr)
+                if streams:
+                    logger.info(f"🔀 Force-un-mixed known-overlap region into {len(streams)} streams")
+                    return SeparationResult(True, streams, 1.0, "sepformer")
+            except Exception as e:
+                logger.warning(f"Sepformer force-separate error ({e}); flagging instead")
+        return SeparationResult(separated=False, overlap_ratio=1.0, method="flagged")
+
     def _separate_sepformer(self, audio: np.ndarray, sr: int) -> List[np.ndarray]:
         import torch
         import librosa
@@ -137,11 +157,38 @@ class SeparationService:
         mix = torch.from_numpy(a8).float().unsqueeze(0).to(self._device)
         est = self._model.separate_batch(mix)          # (batch, time, n_sources)
         est = est.squeeze(0).detach().cpu().numpy()      # (time, n_sources)
-        streams = []
+
+        # Resample each source back to 16k and measure its TRUE energy BEFORE any
+        # normalization. Sepformer-wsj02mix always emits exactly 2 sources even
+        # when the input has only ONE real voice — the extra source is a
+        # low-energy phantom/residual. We must drop it here: if we peak-normalize
+        # it to full scale (as below) and hand it to Whisper, Whisper hallucinates
+        # fluent words nobody said and a phantom speaker identity is minted.
+        raw = []
         for i in range(est.shape[-1]):
-            src = est[:, i]
-            # Resample each separated voice back to 16k for Whisper/embeddings.
-            src16 = librosa.resample(src, orig_sr=target_sr, target_sr=sr)
-            peak = np.max(np.abs(src16)) + 1e-9
-            streams.append((src16 / peak * 0.95).astype(np.float32))
+            src16 = librosa.resample(est[:, i], orig_sr=target_sr, target_sr=sr)
+            rms = float(np.sqrt(np.mean(np.square(src16)))) if len(src16) else 0.0
+            raw.append((src16, rms))
+
+        loudest = max((r for _, r in raw), default=0.0)
+        if loudest <= 0:
+            return []
+
+        # Keep only sources with real energy: above an absolute floor AND a
+        # fraction of the loudest source. A genuine two-voice mix yields two
+        # comparable-energy sources (both kept); a single-voice region yields one
+        # strong + one weak source (only the strong kept → caller sees 1 stream
+        # and treats the region as a single voice, no phantom).
+        rel_floor = float(getattr(self.settings, "separation_stream_rel_floor", 0.30))
+        abs_floor = 1e-3
+        streams = []
+        for src16, rms in raw:
+            if rms >= abs_floor and rms >= rel_floor * loudest:
+                peak = np.max(np.abs(src16)) + 1e-9
+                streams.append((src16 / peak * 0.95).astype(np.float32))
+            else:
+                logger.info(
+                    f"🚫 Dropped phantom Sepformer source (rms={rms:.4f} < "
+                    f"{rel_floor:.2f}×{loudest:.4f}) — likely no real 2nd voice"
+                )
         return streams

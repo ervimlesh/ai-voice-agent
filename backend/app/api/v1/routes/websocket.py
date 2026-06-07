@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import io
 import json
 import logging
@@ -70,6 +71,23 @@ HALLUCINATION_SUBSTRINGS = (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Per-segment latency instrumentation ──────────────────────────────────
+# Accumulates wall-clock time for each pipeline stage so we can see, per spoken
+# turn, exactly where the response delay comes from (Whisper vs diarization vs
+# separation vs ECAPA vs RAG vs Ollama). Stored in a contextvar so the per-clip
+# helpers can roll their numbers up without threading a dict through every call.
+# Set fresh at the top of _process_speech_segment; read at the end.
+_seg_timings: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "_seg_timings", default=None
+)
+
+
+def _add_timing(stage: str, seconds: float) -> None:
+    """Add `seconds` to the running total for `stage` in the current segment."""
+    timings = _seg_timings.get()
+    if timings is not None:
+        timings[stage] = timings.get(stage, 0.0) + seconds
 
 # Shared VAD instance per connection is created in the handler.
 # Whisper, Ollama, diarization and separation are singletons from dependencies.
@@ -204,29 +222,53 @@ async def _safe_send_json(websocket: WebSocket, data: dict) -> bool:
         return False
 
 
-async def _generate_fallback_suggestions(ollama_service, speaker_input: str, speaker_role: str = "Patient") -> list[str]:
+async def _generate_doctor_suggestions(
+    ollama_service,
+    speaker_input: str,
+    speaker_role: str = "Patient",
+    history: Optional[list] = None,
+) -> list[str]:
     """
-    Fallback suggestion generator when RAG database has no matching results.
-    Uses Ollama to intelligently generate relevant follow-up questions a DOCTOR
-    could ask next — regardless of whether the doctor or the patient is speaking.
+    Generate doctor-facing follow-up QUESTIONS from the conversation context
+    using Ollama only (no RAG). Whoever is speaking — Doctor or Patient — this
+    returns 3 concise questions the DOCTOR could ask next. This replaces the old
+    RAG suggestion path; the UI shows these in the sidebar (it does NOT show a
+    full AI answer), so we deliberately generate short questions, not prose.
     """
     try:
+        # Build a short recent-conversation context block so the suggestions
+        # reflect the running consultation, not just the last sentence. This is
+        # the "from that context" behaviour the assistant needs.
+        context_block = ""
+        if history:
+            recent = history[-6:]  # last few turns is plenty of context
+            lines = []
+            for m in recent:
+                role = getattr(m, "role", None) or (m.get("role") if isinstance(m, dict) else None)
+                content = getattr(m, "content", None) or (m.get("content") if isinstance(m, dict) else None)
+                if content and str(content).strip():
+                    speaker = "Doctor" if role == "assistant" else "Speaker"
+                    lines.append(f"{speaker}: {str(content).strip()}")
+            if lines:
+                context_block = "Conversation so far:\n" + "\n".join(lines) + "\n\n"
+
         if speaker_role == "Doctor":
-            context_line = f'Doctor just said: "{speaker_input}"'
+            context_line = f'The doctor just said: "{speaker_input}"'
             guidance = (
                 "Generate ONLY 3 concise, medical follow-up questions the doctor could ask next "
-                "to deepen the clinical picture (history, differential, red flags). One per line, no numbering."
+                "to deepen the clinical picture (history, differential, red flags)."
             )
         else:
-            context_line = f'Patient just said: "{speaker_input}"'
+            context_line = f'The patient just said: "{speaker_input}"'
             guidance = (
                 "Generate ONLY 3 concise, medical follow-up questions the doctor should ask the patient. "
-                "One per line, no numbering. Make them relevant to what the patient mentioned and useful for diagnosis."
+                "Make them relevant to what the patient mentioned and useful for diagnosis."
             )
 
-        suggestion_prompt = f"""{context_line}
+        suggestion_prompt = f"""{context_block}{context_line}
 
 {guidance}
+Output ONLY the 3 questions, one per line, no numbering, no preamble, no extra text.
 
 Example format:
 How long have you had this?
@@ -238,28 +280,38 @@ Now generate 3 questions."""
         messages = [
             {
                 "role": "system",
-                "content": "You are a medical assistant helping doctors. Generate helpful follow-up questions."
+                "content": "You are a medical assistant helping doctors. Generate helpful follow-up questions only — never a full answer.",
             },
             {
                 "role": "user",
-                "content": suggestion_prompt
-            }
+                "content": suggestion_prompt,
+            },
         ]
 
-        response = await ollama_service._chat(messages)
+        # Cap output so generation is fast and stays as short questions, never a
+        # long essay. num_predict bounds the token count; low temperature keeps
+        # the questions focused.
+        response = await ollama_service._chat(
+            messages, options={"num_predict": 120, "temperature": 0.3}
+        )
 
-        # Parse response into list of questions
-        questions = [q.strip() for q in response.split('\n') if q.strip()]
-        suggestions = questions[:3]  # Take first 3
+        # Parse response into a list of questions, stripping any stray numbering
+        # / bullet prefixes the model may add despite instructions.
+        suggestions: list[str] = []
+        for line in response.split("\n"):
+            q = re.sub(r"^\s*(?:\d+[\.\)]|[-*•])\s*", "", line).strip()
+            if q:
+                suggestions.append(q)
+        suggestions = suggestions[:3]
 
         if suggestions:
-            print(f"💡 Fallback Suggestions (from Ollama): {suggestions}")
+            print(f"💡 Doctor suggestions (from Ollama): {suggestions}")
 
         return suggestions
 
     except Exception as e:
-        logger.warning(f"Error generating fallback suggestions: {e}")
-        print(f"⚠️ Could not generate fallback suggestions: {e}")
+        logger.warning(f"Error generating doctor suggestions: {e}")
+        print(f"⚠️ Could not generate doctor suggestions: {e}")
         return []
 
 
@@ -505,13 +557,42 @@ async def _get_suggestions(rag_service, ollama_service, text: str, role: str) ->
             print(f"🔍 RAG Suggestions ({role} spoke): {suggestions}")
             return suggestions
         print(f"📌 No RAG results, generating with Ollama (speaker={role})...")
-        return await _generate_fallback_suggestions(ollama_service, text, role)
+        return await _generate_doctor_suggestions(ollama_service, text, role)
     except asyncio.TimeoutError:
         logger.warning("RAG timed out; generating fallback suggestions")
-        return await _generate_fallback_suggestions(ollama_service, text, role)
+        return await _generate_doctor_suggestions(ollama_service, text, role)
     except Exception as e:
         logger.warning(f"RAG error: {e}; generating fallback suggestions")
-        return await _generate_fallback_suggestions(ollama_service, text, role)
+        return await _generate_doctor_suggestions(ollama_service, text, role)
+
+
+def _compute_overlap_flags(diar_turns, min_overlap_s: float) -> list[bool]:
+    """Label each diarized turn as overlapping or not, from PURE diarization
+    geometry (no audio model — so it can never invent an overlap).
+
+    A turn is flagged overlapping iff it shares at least `min_overlap_s` seconds
+    of wall-clock time with some OTHER turn. The returned list is aligned to the
+    input order. The flag is used only to render the "[overlapping speech]"
+    label; the transcript text always comes from the real recorded audio of that
+    turn, so we never show words nobody spoke.
+
+    Sub-`min_overlap_s` overlaps (pyannote boundary padding) are ignored, which
+    is why two sequential utterances by one person are NOT flagged.
+    """
+    n = len(diar_turns)
+    flags = [False] * n
+    for i in range(n):
+        a = diar_turns[i]
+        for j in range(n):
+            if i == j:
+                continue
+            b = diar_turns[j]
+            shared = min(a.end, b.end) - max(a.start, b.start)
+            # 1e-6 epsilon so exact-boundary overlaps aren't lost to float error.
+            if shared >= min_overlap_s - 1e-6:
+                flags[i] = True
+                break
+    return flags
 
 
 async def _transcribe_and_label_clip(
@@ -531,9 +612,11 @@ async def _transcribe_and_label_clip(
 
     clip_dur_s = len(clip) / sr if sr else 0.0
     rms = float(np.sqrt(np.mean(np.square(clip)))) if len(clip) else 0.0
+    _t0 = time.perf_counter()
     text, lang = await asyncio.wait_for(
         whisper_service.transcribe_array(clip, sr), timeout=_ws_settings.transcribe_timeout_s
     )
+    _add_timing("whisper", time.perf_counter() - _t0)
     # Multi-voice diagnostics: show every clip Whisper sees, its loudness,
     # and which filter (if any) rejected it. If ChatGPT's voice is captured
     # but missing from the UI, the reject reason here tells you why.
@@ -572,7 +655,9 @@ async def _transcribe_and_label_clip(
     # separated overlapping streams); fall back to lightweight MFCC embedding.
     emb = None
     if voice_embedder is not None and voice_embedder.available:
+        _t0 = time.perf_counter()
         emb = await asyncio.to_thread(voice_embedder.embed, clip, sr)
+        _add_timing("ecapa", time.perf_counter() - _t0)
     if emb is not None:
         speaker_id, is_new = registry.identify(emb, threshold=voice_embedder.recommended_threshold)
     else:
@@ -630,6 +715,9 @@ async def _process_speech_segment(
     """Multi-speaker pipeline: diarize -> (un-mix overlap) -> transcribe per turn
     -> identify speaker -> assign role -> emit labeled turns -> AI reply on the
     last Patient turn."""
+    # Fresh per-segment timing accumulator (see _seg_timings / _add_timing).
+    _seg_timings.set({})
+    _seg_t_start = time.perf_counter()
     try:
         if not await _safe_send_json(websocket, {
             "type": "processing",
@@ -677,44 +765,48 @@ async def _process_speech_segment(
         settings = get_settings()
         min_turn = settings.min_turn_duration_s
 
-        # 0) PRE-DIARIZATION OVERLAP CHECK: if heavy talk-over is detected on the
-        # whole segment, un-mix into separate voice streams BEFORE diarization.
-        # This catches the case where two speakers are simultaneous for most of
-        # the segment — diarization would otherwise pick one dominant voice and
-        # silently drop the other.
+        # ── REAL-AUDIO-ONLY PIPELINE (no source separation / un-mixing) ──────
+        # We deliberately do NOT un-mix overlapping speech. The Sepformer
+        # (wsj02mix) model is trained on clean 8 kHz studio mixtures and, on
+        # far-field consumer-mic audio, it manufactures phantom streams and
+        # splits a single voice in two — which Whisper then transcribes into
+        # confident words NOBODY said, plus phantom speaker identities. The only
+        # way to guarantee "every word shown was actually spoken" is to transcribe
+        # the REAL recorded audio for each diarized turn exactly once. Genuine
+        # talk-over is still LABELLED as overlapping (from diarization geometry),
+        # but we show the real dominant-voice transcript instead of inventing the
+        # second voice. This is the honest, internationally-safe behaviour.
         emitted_turns: list[dict] = []
         last_patient_text: Optional[str] = None
         last_patient_speaker_id: Optional[str] = None
         last_lang = "en"
 
-        whole_sep = await asyncio.to_thread(separator.maybe_separate, audio, sr)
-        if whole_sep.separated and whole_sep.streams:
-            print(
-                f"🔀 Pre-diarize: un-mixed full segment into {len(whole_sep.streams)} "
-                f"stream(s) (overlap ratio={whole_sep.overlap_ratio:.2f})"
-            )
-            for stream in whole_sep.streams:
-                turn = await _transcribe_and_label_clip(
-                    stream, sr, True, whisper_service, speaker_detector,
-                    role_detector, registry, 0.0, len(stream) / sr, voice_embedder,
-                )
-                if turn:
-                    emitted_turns.append(turn)
-                    last_lang = turn["language"]
-                    if turn["role"] == "Patient":
-                        last_patient_text = turn["text"].replace("[overlapping speech] ", "")
-                        last_patient_speaker_id = turn["speaker_id"]
+        def _emit(turn):
+            nonlocal last_lang, last_patient_text, last_patient_speaker_id
+            if not turn:
+                return
+            emitted_turns.append(turn)
+            last_lang = turn["language"]
+            if turn["role"] == "Patient":
+                last_patient_text = turn["text"].replace("[overlapping speech] ", "")
+                last_patient_speaker_id = turn["speaker_id"]
 
-            # When the whole segment was un-mixed, skip per-turn diarization —
-            # the streams are already speaker-separated.
-            diar_turns = []
-        else:
-            # 1) DIARIZE the segment into per-speaker turns.
-            diar_turns = await asyncio.to_thread(diarizer.diarize, audio, sr)
-            print(f"🗣️ Diarization produced {len(diar_turns)} turn(s) via {diarizer.backend}")
+        # 1) DIARIZE the segment into per-speaker turns (uses the real waveform).
+        _t0 = time.perf_counter()
+        diar_turns = await asyncio.to_thread(diarizer.diarize, audio, sr)
+        _add_timing("diarization", time.perf_counter() - _t0)
+        diar_turns = sorted(diar_turns, key=lambda t: t.start)
+        print(f"🗣️ Diarization produced {len(diar_turns)} turn(s) via {diarizer.backend}")
 
-        # 2) Process each diarized turn in temporal order.
-        for dt in diar_turns:
+        # 2) Overlap LABELS from pure diarization geometry — a turn is flagged
+        # overlapping only if it shares ≥ OVERLAP_MIN_REGION_S of time with
+        # another turn. No audio model, so it can never invent an overlap.
+        overlap_flags = _compute_overlap_flags(diar_turns, settings.overlap_min_region_s)
+        if any(overlap_flags):
+            print(f"🔀 Diarization shows {sum(overlap_flags)} turn(s) with genuine time-overlap")
+
+        # 3) Transcribe each turn ONCE from the real audio.
+        for dt, ov_flag in zip(diar_turns, overlap_flags):
             s_idx = max(0, int(dt.start * sr))
             e_idx = min(len(audio), int(dt.end * sr))
             clip = audio[s_idx:e_idx]
@@ -722,42 +814,17 @@ async def _process_speech_segment(
             if len(clip) < int(min_turn * sr):
                 # IMPORTANT: this is where short virtual-voice utterances die.
                 # Lower MIN_TURN_DURATION_S in .env to capture shorter clips
-                # (e.g. ChatGPT one-word replies, brief acknowledgements).
+                # (e.g. brief acknowledgements).
                 print(
-                    f"⏭️  Skipped diarized turn @{dt.start:.2f}-{dt.end:.2f}s "
+                    f"⏭️  Skipped turn @{dt.start:.2f}-{dt.end:.2f}s "
                     f"(dur={clip_dur:.2f}s < MIN_TURN_DURATION_S={min_turn}s)"
                 )
                 continue
 
-            # 2a) Overlap handling: detect, and un-mix with Sepformer if available.
-            sep = await asyncio.to_thread(separator.maybe_separate, clip, sr)
-
-            if sep.separated and sep.streams:
-                # True talk-over un-mixed into multiple voice streams.
-                for stream in sep.streams:
-                    turn = await _transcribe_and_label_clip(
-                        stream, sr, False, whisper_service, speaker_detector,
-                        role_detector, registry, dt.start, dt.end, voice_embedder,
-                    )
-                    if turn:
-                        emitted_turns.append(turn)
-                        last_lang = turn["language"]
-                        if turn["role"] == "Patient":
-                            last_patient_text = turn["text"].replace("[overlapping speech] ", "")
-                            last_patient_speaker_id = turn["speaker_id"]
-            else:
-                # Single dominant voice (optionally flagged as overlapped).
-                overlap_flag = sep.method == "flagged"
-                turn = await _transcribe_and_label_clip(
-                    clip, sr, overlap_flag, whisper_service, speaker_detector,
-                    role_detector, registry, dt.start, dt.end, voice_embedder,
-                )
-                if turn:
-                    emitted_turns.append(turn)
-                    last_lang = turn["language"]
-                    if turn["role"] == "Patient":
-                        last_patient_text = turn["text"].replace("[overlapping speech] ", "")
-                        last_patient_speaker_id = turn["speaker_id"]
+            _emit(await _transcribe_and_label_clip(
+                clip, sr, ov_flag, whisper_service, speaker_detector,
+                role_detector, registry, dt.start, dt.end, voice_embedder,
+            ))
 
         if not emitted_turns:
             await _safe_send_json(websocket, {
@@ -926,13 +993,10 @@ async def _process_speech_segment(
         driver_role = "Patient" if last_patient_text else emitted_turns[-1]["role"]
         driver_speaker_id = last_patient_speaker_id or emitted_turns[-1]["speaker_id"]
 
-        rag_suggestions = await _get_suggestions(
-            rag_service, ollama_service, driver_text, driver_role)
-
         if not await _safe_send_json(websocket, {
             "type": "processing",
             "stage": "thinking",
-            "message": "AI is thinking...",
+            "message": "Generating suggestions...",
             "timestamp": time.time(),
         }):
             return
@@ -940,34 +1004,41 @@ async def _process_speech_segment(
         # MULTI-VOICE CONTEXT: build a role-tagged transcript of this segment.
         # When the user is talking to another voice agent (ChatGPT voice), both
         # voices arrive in the same audio segment and are diarized as separate
-        # turns. The LLM must see BOTH — using per-speaker history alone hides
-        # the other voice and the assistant replies without context.
+        # turns. The suggester must see BOTH — using per-speaker history alone
+        # hides the other voice and the suggestions lose context.
         segment_user_text = ConversationState.build_segment_user_text(merged_turns) or driver_text
 
-        # Use the unified chronological history so the LLM sees EVERY speaker's
-        # prior turns, not just the driver's. This is what makes the multi-voice
-        # mode work: the "other" voice (e.g. ChatGPT) becomes part of context.
+        # Unified chronological history so the suggester sees EVERY speaker's
+        # prior turns, giving context-aware doctor questions.
         history = state.get_unified_history()
+
+        # ── Doctor question suggestions from Ollama (RAG replacement) ─────────
+        # The UI shows ONLY these suggested questions in the sidebar — it does
+        # NOT display a full AI answer. So we generate short doctor follow-up
+        # questions directly instead of an essay-length reply. This also removes
+        # the wasted ask_generic_english call that the frontend was discarding.
         try:
-            reply = await asyncio.wait_for(
-                ollama_service.ask_generic_english(segment_user_text, history, last_lang),
+            _t0 = time.perf_counter()
+            rag_suggestions = await asyncio.wait_for(
+                _generate_doctor_suggestions(
+                    ollama_service, segment_user_text, driver_role, history),
                 timeout=_ws_settings.ollama_timeout_s,
             )
-            print(f"✅ AI Reply (driver={driver_role}/{driver_speaker_id}, "
-                  f"{len(merged_turns)} turn(s) in segment): {reply}")
+            _add_timing("ollama", time.perf_counter() - _t0)
+            print(f"✅ Doctor suggestions (driver={driver_role}/{driver_speaker_id}, "
+                  f"{len(merged_turns)} turn(s) in segment): {rag_suggestions}")
         except asyncio.TimeoutError:
-            logger.error("Ollama response generation timed out")
-            await _safe_send_json(websocket, {
-                "type": "error",
-                "message": "AI response generation took too long, please try again",
-                "timestamp": time.time(),
-            })
-            return
+            logger.error("Ollama suggestion generation timed out")
+            rag_suggestions = []
 
-        # Append this segment's combined transcript + reply to the unified history
-        # so the next segment's LLM call sees the full multi-voice conversation.
+        # Full AI answer is intentionally NOT generated — the frontend discards
+        # it and only renders the suggestions above. Kept as an empty string for
+        # backwards-compat with clients that still read `reply`.
+        reply = ""
+
+        # Append this segment's combined transcript to the unified history so the
+        # next segment's suggestions see the full multi-voice conversation.
         state.append_unified_user(segment_user_text)
-        state.append_unified_assistant(reply)
 
         await _safe_send_json(websocket, {
             "type": "response",
@@ -995,5 +1066,22 @@ async def _process_speech_segment(
             "message": f"Processing error: {str(e)}",
             "timestamp": time.time(),
         })
+    finally:
+        # Per-segment latency breakdown: shows exactly where the response delay
+        # comes from. "other" is total wall-clock minus the measured stages
+        # (dedup/merge, JSON sends, numpy work). "whisper"/"separation"/"ecapa"
+        # are summed across all clips/turns in the segment.
+        timings = _seg_timings.get() or {}
+        total = time.perf_counter() - _seg_t_start
+        measured = sum(timings.values())
+        parts = " ".join(
+            f"{stage}={timings[stage]:.2f}s"
+            for stage in ("separation", "diarization", "whisper", "ecapa", "rag", "ollama")
+            if stage in timings
+        )
+        print(
+            f"⏱  Segment latency: {parts} "
+            f"other={max(0.0, total - measured):.2f}s TOTAL={total:.2f}s"
+        )
 
 

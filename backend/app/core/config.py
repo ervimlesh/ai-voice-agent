@@ -64,6 +64,19 @@ class Settings(BaseSettings):
     separation_backend: str = Field(default="auto", alias="SEPARATION_BACKEND")
     # Fraction of a segment that must be flagged as overlap before we attempt un-mixing.
     overlap_min_ratio: float = Field(default=0.15, alias="OVERLAP_MIN_RATIO")
+    # A separated Sepformer source is kept only if its energy (RMS) is at least
+    # this fraction of the loudest source. Sepformer always emits 2 sources even
+    # for single-voice audio; the phantom 2nd source is low-energy and, if kept,
+    # makes Whisper hallucinate words nobody said. Raise to be stricter (drop
+    # more phantoms), lower if a genuine quiet 2nd voice is being discarded.
+    separation_stream_rel_floor: float = Field(default=0.30, alias="SEPARATION_STREAM_REL_FLOOR")
+    # Minimum duration (seconds) of a time-overlap BETWEEN two diarized turns
+    # before we force-un-mix that shared region. Pyannote often emits tiny
+    # (<0.3s) boundary overlaps that are just padding, not real talk-over; this
+    # ignores those while catching genuine 1-2s talk-over that the per-clip
+    # ratio heuristic dilutes below overlap_min_ratio. Lower to catch shorter
+    # talk-over, raise to be more conservative.
+    overlap_min_region_s: float = Field(default=0.3, alias="OVERLAP_MIN_REGION_S")
 
     # ── Realtime WebSocket pipeline tunables (the /ws/audio-stream flow) ──
     # All previously-hardcoded constants from app/api/v1/routes/websocket.py,

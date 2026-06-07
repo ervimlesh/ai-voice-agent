@@ -12,12 +12,20 @@ class OllamaService:
         self.settings = settings
         self.chat_url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
 
-    async def _chat(self, messages: list[dict[str, str]]) -> str:
+    async def _chat(
+        self,
+        messages: list[dict[str, str]],
+        options: dict | None = None,
+    ) -> str:
         payload = {
             "model": self.settings.ollama_model,
             "messages": messages,
             "stream": False,
         }
+        # Ollama runtime options (e.g. num_predict to cap output length,
+        # temperature). Passed through verbatim when provided.
+        if options:
+            payload["options"] = options
         async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(self.chat_url, json=payload)
             response.raise_for_status()
